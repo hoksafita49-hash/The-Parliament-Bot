@@ -9,6 +9,7 @@ const {
 const gameManager = require('./mysteryGameManager');
 
 const RECRUITMENT_DURATION_MS = 3 * 60 * 1000;
+const RESULT_REVEAL_DELAY_MS = 5 * 1000;
 const ROULETTE_TIMEOUT_DURATION_MS = 5 * 60 * 1000;
 const ROULETTE_TIMEOUT_REASON = '神秘指令：运气轮盘';
 const MAX_PARTICIPANTS = 6;
@@ -228,6 +229,32 @@ async function sendPublicPanel(game, payload, action) {
     }
 }
 
+function waitForResultReveal(game) {
+    if (game.ended || game.state !== 'starting') return Promise.resolve(false);
+    return new Promise(resolve => {
+        let finished = false;
+        let timer;
+        const finish = revealed => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            game.timers.delete(timer);
+            if (game.resultReveal?.timer === timer) game.resultReveal = null;
+            resolve(revealed);
+        };
+        timer = setTimeout(() => finish(true), game.resultRevealDelayMs);
+        timer.unref?.();
+        game.timers.add(timer);
+        game.resultReveal = { timer, finish };
+    });
+}
+
+function cancelResultReveal(game) {
+    if (!game?.resultReveal) return false;
+    game.resultReveal.finish(false);
+    return true;
+}
+
 function queueRecruitmentPanelEdit(game, action, finalize) {
     const version = (game.recruitmentPanelVersion || 0) + 1;
     game.recruitmentPanelVersion = version;
@@ -301,6 +328,7 @@ function scheduleComponentDisable(game) {
 }
 
 async function cleanupRouletteGame(game) {
+    cancelResultReveal(game);
     await waitForRecruitmentPanelQueue(game);
     if (!game.componentsDisabled) {
         await scheduleComponentDisable(game);
@@ -404,6 +432,10 @@ async function settleClaimedGame(game) {
             components: [],
         }, 'starting-panel');
         if (!startingMessage) {
+            await cleanupRouletteGame(game);
+            return;
+        }
+        if (!await waitForResultReveal(game)) {
             await cleanupRouletteGame(game);
             return;
         }
@@ -515,6 +547,7 @@ async function startRoulette(interaction) {
         recruitmentPanelVersion: 0,
         recruitmentPanelCompletedVersion: 0,
         recruitmentPanelQueue: Promise.resolve(),
+        resultRevealDelayMs: RESULT_REVEAL_DELAY_MS,
         random: Math.random,
         timers: new Set(),
     };
@@ -541,6 +574,7 @@ async function startRoulette(interaction) {
         }
     };
     provisionalGame.disableComponents = () => {
+        cancelResultReveal(game);
         void scheduleComponentDisable(game);
     };
 
