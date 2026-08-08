@@ -18,6 +18,7 @@ const CHANNEL_BUSY_MESSAGE = '🎮 **这里已经有一场游戏在进行了。*
 const INVALID_OPPONENT_MESSAGE = '⚔️ **这个对手现在无法参加死斗。**\n换个人再试试吧。';
 const WRONG_INVITEE_MESSAGE = '🚫 **这不是发给你的邀请。**';
 const TIMEOUT_BLOCKED_MESSAGE = '⚔️ **你现在无法参加死斗。**\n你当前还在禁言，暂时无法参加。';
+const INVALID_INITIATOR_MESSAGE = '⚔️ **你现在无法参加死斗。**';
 const EXPIRED_MESSAGE = '⌛ **这场死斗已经结束或失效了。**';
 const SELF_ACCEPT_MESSAGE = '⚔️ **不能接受自己发起的死斗。**';
 const DUPLICATE_CHOICE_MESSAGE = '✋ **本轮已经出过拳了。**\n选择不能修改。';
@@ -584,12 +585,13 @@ async function startDuel(interaction, requestedOpponent) {
     if (!isCurrentGuildMember(provisionalGame, initiator, userId)) {
         await safeEphemeralReply(
             interaction,
-            isActivelyTimedOut(initiator) ? TIMEOUT_BLOCKED_MESSAGE : INVALID_OPPONENT_MESSAGE,
+            isActivelyTimedOut(initiator) ? TIMEOUT_BLOCKED_MESSAGE : INVALID_INITIATOR_MESSAGE,
             provisionalGame
         );
         return false;
     }
 
+    let opponent = null;
     if (provisionalGame.requestedOpponentId) {
         if (
             provisionalGame.requestedOpponentId === userId
@@ -598,7 +600,7 @@ async function startDuel(interaction, requestedOpponent) {
             await safeEphemeralReply(interaction, INVALID_OPPONENT_MESSAGE, provisionalGame);
             return false;
         }
-        const opponent = await safeFetchMember(provisionalGame, provisionalGame.requestedOpponentId);
+        opponent = await safeFetchMember(provisionalGame, provisionalGame.requestedOpponentId);
         if (!isCurrentGuildMember(
             provisionalGame,
             opponent,
@@ -619,6 +621,30 @@ async function startDuel(interaction, requestedOpponent) {
     provisionalGame.disableComponents = () => {
         if (!game?.componentsDisabled) void disableInvitation(game);
     };
+
+    let finalPreflightRejection = null;
+    if (!isCurrentGuildMember(provisionalGame, initiator, userId)) {
+        finalPreflightRejection = isActivelyTimedOut(initiator)
+            ? TIMEOUT_BLOCKED_MESSAGE
+            : INVALID_INITIATOR_MESSAGE;
+    } else if (
+        provisionalGame.requestedOpponentId
+        && (
+            !isCurrentGuildMember(
+                provisionalGame,
+                opponent,
+                provisionalGame.requestedOpponentId
+            )
+            || gameManager.getPlayerGame(guildId, provisionalGame.requestedOpponentId)
+        )
+    ) {
+        finalPreflightRejection = INVALID_OPPONENT_MESSAGE;
+    }
+    if (finalPreflightRejection) {
+        await safeEphemeralReply(interaction, finalPreflightRejection, provisionalGame);
+        return false;
+    }
+
     const created = gameManager.createGame(provisionalGame);
     if (!created.ok) {
         await safeEphemeralReply(
@@ -750,6 +776,7 @@ async function handleAccept(interaction, game) {
             }
         });
         await cleanupDuelGame(game);
+        await safeEphemeralReply(interaction, EXPIRED_MESSAGE, game);
         return false;
     }
     const delivered = await deliverRoundPanels(game, round);
