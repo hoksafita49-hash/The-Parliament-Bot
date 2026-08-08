@@ -52,6 +52,13 @@ function isValidHumanMember(member) {
     return Boolean(member?.id && member.user && !member.user.bot && !isActivelyTimedOut(member));
 }
 
+function isCurrentGuildMember(game, member, userId = member?.id) {
+    if (!isValidHumanMember(member) || member.id !== userId) return false;
+    const memberGuildId = member.guild?.id || member.guildId;
+    if (!memberGuildId || memberGuildId !== game.guildId) return false;
+    return game.guild?.members?.cache?.get(userId) === member;
+}
+
 async function safeFetchMember(game, userId) {
     try {
         return await game.guild?.members?.fetch(userId) || null;
@@ -291,6 +298,11 @@ async function disableInvitation(game) {
     return disabled;
 }
 
+async function disableInvitationWithRetry(game) {
+    if (await disableInvitation(game)) return true;
+    return disableInvitation(game);
+}
+
 async function cleanupDuelGame(game) {
     if (!game || game.cleanupStarted) return game?.cleanupPromise;
     game.cleanupStarted = true;
@@ -380,7 +392,11 @@ function claimRoundResolution(game, round, mode) {
 
     if (winnerId) game.scores[winnerId] += 1;
     const final = Boolean(winnerId && game.scores[winnerId] >= 2);
-    if (final) game.pendingFinalRoundId = round.id;
+    let effectToken = null;
+    if (final) {
+        effectToken = randomUUID().replaceAll('-', '').slice(0, 16);
+        game.pendingFinal = { roundId: round.id, effectToken };
+    }
     return {
         outcome,
         final,
@@ -390,11 +406,11 @@ function claimRoundResolution(game, round, mode) {
         loserId,
         choices: Object.fromEntries(round.choices),
         scores: { ...game.scores },
+        effectToken,
     };
 }
 
-async function applyLoserTimeout(game, snapshot) {
-    const loser = await safeFetchMember(game, snapshot.loserId);
+async function applyLoserTimeout(game, snapshot, loser) {
     if (!loser?.moderatable || typeof loser.timeout !== 'function') return false;
     try {
         await loser.timeout(DUEL_TIMEOUT_DURATION_MS, DUEL_TIMEOUT_REASON);
@@ -436,25 +452,68 @@ async function publishRoundResolution(game, snapshot) {
     }
 
     if (snapshot.final) {
-        let finalClaimed = false;
+        const finalMembers = new Map();
+        const fetchedMembers = await Promise.all([
+            safeFetchMember(game, game.initiatorId),
+            safeFetchMember(game, game.opponentId),
+        ]);
+        finalMembers.set(game.initiatorId, fetchedMembers[0]);
+        finalMembers.set(game.opponentId, fetchedMembers[1]);
+
+        let finalDecision = null;
         await gameManager.runExclusive(game, () => {
             if (
                 game.ended
                 || game.state !== 'round'
                 || game.round?.id !== snapshot.roundId
-                || game.pendingFinalRoundId !== snapshot.roundId
+                || game.pendingFinal?.roundId !== snapshot.roundId
+                || game.pendingFinal?.effectToken !== snapshot.effectToken
             ) return;
+
+            const participantsCurrent = game.participantIds.every(userId => (
+                isCurrentGuildMember(game, finalMembers.get(userId), userId)
+            ));
             game.state = 'ended';
-            game.pendingFinalRoundId = null;
-            finalClaimed = true;
+            game.pendingFinal = null;
+            if (!participantsCurrent) {
+                game.finalEffect = { token: snapshot.effectToken, phase: 'cancelled' };
+                finalDecision = 'cancel';
+                return;
+            }
+
+            game.finalEffect = { token: snapshot.effectToken, phase: 'applying-timeout' };
+            finalDecision = 'apply';
         });
-        if (!finalClaimed) return false;
-        const timeoutApplied = await applyLoserTimeout(game, snapshot);
+        if (!finalDecision) return false;
+        if (finalDecision === 'cancel') {
+            await queuePublicWrite(game, () => safeSend(
+                game,
+                { embeds: [makeEmbed(INVALIDATED_DESCRIPTION)] },
+                'final-member-invalidated-cancel'
+            ));
+            await cleanupDuelGame(game);
+            return false;
+        }
+
+        const timeoutApplied = await applyLoserTimeout(
+            game,
+            snapshot,
+            finalMembers.get(snapshot.loserId)
+        );
+        if (
+            game.finalEffect?.token === snapshot.effectToken
+            && game.finalEffect.phase === 'applying-timeout'
+        ) {
+            game.finalEffect.phase = 'publishing-result';
+        }
         const finalMessage = await queuePublicWrite(game, () => safeSend(
             game,
             { embeds: [makeEmbed(finalDescription(game, snapshot, !timeoutApplied))] },
             'final-result'
         ));
+        if (game.finalEffect?.token === snapshot.effectToken) {
+            game.finalEffect.phase = 'complete';
+        }
         await cleanupDuelGame(game);
         return Boolean(finalMessage);
     }
@@ -522,7 +581,7 @@ async function startDuel(interaction, requestedOpponent) {
     };
 
     const initiator = await safeFetchMember(provisionalGame, userId);
-    if (!isValidHumanMember(initiator)) {
+    if (!isCurrentGuildMember(provisionalGame, initiator, userId)) {
         await safeEphemeralReply(
             interaction,
             isActivelyTimedOut(initiator) ? TIMEOUT_BLOCKED_MESSAGE : INVALID_OPPONENT_MESSAGE,
@@ -540,7 +599,11 @@ async function startDuel(interaction, requestedOpponent) {
             return false;
         }
         const opponent = await safeFetchMember(provisionalGame, provisionalGame.requestedOpponentId);
-        if (!isValidHumanMember(opponent)) {
+        if (!isCurrentGuildMember(
+            provisionalGame,
+            opponent,
+            provisionalGame.requestedOpponentId
+        )) {
             await safeEphemeralReply(interaction, INVALID_OPPONENT_MESSAGE, provisionalGame);
             return false;
         }
@@ -654,7 +717,7 @@ async function handleAccept(interaction, game) {
             rejection = PLAYER_BUSY_MESSAGE;
             return;
         }
-        if (!isValidHumanMember(member)) {
+        if (!isCurrentGuildMember(game, member, userId)) {
             rejection = isActivelyTimedOut(member) ? TIMEOUT_BLOCKED_MESSAGE : INVALID_OPPONENT_MESSAGE;
             return;
         }
@@ -679,7 +742,16 @@ async function handleAccept(interaction, game) {
         return false;
     }
 
-    await disableInvitation(game);
+    const invitationDisabled = await disableInvitationWithRetry(game);
+    if (!invitationDisabled) {
+        await gameManager.runExclusive(game, () => {
+            if (!game.ended && game.state === 'round' && game.round === round) {
+                game.state = 'ended';
+            }
+        });
+        await cleanupDuelGame(game);
+        return false;
+    }
     const delivered = await deliverRoundPanels(game, round);
     return delivered === true;
 }
@@ -714,12 +786,14 @@ async function handleChoice(interaction, game, roundId, choice) {
         }
     });
 
-    await safeEphemeralReply(
-        interaction,
-        accepted ? CHOICE_RECORDED_MESSAGE : (rejection || EXPIRED_MESSAGE),
-        game
-    );
-    if (!accepted) return false;
+    if (!accepted) {
+        await safeEphemeralReply(interaction, rejection || EXPIRED_MESSAGE, game);
+        return false;
+    }
+
+    // The choice is authoritative once committed. A failed private acknowledgement
+    // must never roll it back, reopen the round, or prevent an owned settlement.
+    await safeEphemeralReply(interaction, CHOICE_RECORDED_MESSAGE, game);
     if (snapshot) await publishRoundResolution(game, snapshot);
     return true;
 }
