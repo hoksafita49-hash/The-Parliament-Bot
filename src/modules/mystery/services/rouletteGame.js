@@ -194,15 +194,11 @@ async function editPublicPanel(game, payload, action) {
     }
 }
 
-async function refreshValidParticipants(game) {
+async function fetchValidParticipants(game, participantIds) {
     const validMembers = new Map();
-    for (const userId of [...game.participantIds]) {
+    for (const userId of participantIds) {
         const member = await fetchMember(game, userId);
-        if (!isValidHumanMember(member)) {
-            gameManager.removePlayer(game, userId);
-            continue;
-        }
-        validMembers.set(userId, member);
+        if (isValidHumanMember(member)) validMembers.set(userId, member);
     }
     return validMembers;
 }
@@ -225,10 +221,14 @@ async function applyTimeouts(game, outcome, members) {
     return failedIds;
 }
 
-async function finishRecruitment(game) {
+async function claimSettlement(game) {
     let ownsSettlement = false;
-    await gameManager.runExclusive(game, async () => {
+    await gameManager.runExclusive(game, () => {
         if (game.ended || game.state !== 'recruiting') return;
+        if (game.pendingJoins > 0) {
+            game.startRequested = true;
+            return;
+        }
 
         game.state = 'starting';
         ownsSettlement = true;
@@ -237,39 +237,69 @@ async function finishRecruitment(game) {
             game.timers.delete(game.recruitmentTimer);
             game.recruitmentTimer = null;
         }
+    });
+    return ownsSettlement;
+}
 
-        const members = await refreshValidParticipants(game);
-        if (game.participantIds.length < MIN_PARTICIPANTS) {
-            await editPublicPanel(game, {
-                embeds: [makeEmbed(cancellationDescription())],
-                components: [joinRow(game.id, true)],
-            }, 'cancel-panel');
+async function settleClaimedGame(game) {
+    const startingPanelUpdated = await editPublicPanel(game, {
+        embeds: [makeEmbed(startingDescription(game.participantIds.length))],
+        components: [joinRow(game.id, true)],
+    }, 'starting-panel');
+    if (startingPanelUpdated) game.componentsDisabled = true;
+
+    const participantSnapshot = [...game.participantIds];
+    const fetchedMembers = await fetchValidParticipants(game, participantSnapshot);
+    let decision = null;
+    await gameManager.runExclusive(game, () => {
+        if (game.ended || game.state !== 'starting' || game.resolved) return;
+
+        for (const userId of participantSnapshot) {
+            if (game.participantIds.includes(userId) && !fetchedMembers.has(userId)) {
+                gameManager.removePlayer(game, userId);
+            }
+        }
+
+        const participantIds = game.participantIds.filter(userId => fetchedMembers.has(userId));
+        if (participantIds.length < MIN_PARTICIPANTS) {
             game.state = 'ended';
+            decision = { cancelled: true };
             return;
         }
 
-        await editPublicPanel(game, {
-            embeds: [makeEmbed(startingDescription(game.participantIds.length))],
-            components: [joinRow(game.id, true)],
-        }, 'starting-panel');
-
-        const outcome = drawRouletteOutcome(game.participantIds, game.random);
+        const outcome = drawRouletteOutcome(participantIds, game.random);
         game.outcome = outcome;
         game.resolved = true;
-        const failedIds = await applyTimeouts(game, outcome, members);
+        game.state = 'ended';
+        decision = { cancelled: false, outcome };
+    });
+
+    if (!decision) return;
+    if (decision.cancelled) {
+        const cancellationUpdated = await editPublicPanel(game, {
+            embeds: [makeEmbed(cancellationDescription())],
+            components: [joinRow(game.id, true)],
+        }, 'cancel-panel');
+        if (cancellationUpdated) game.componentsDisabled = true;
+    } else {
+        const failedIds = await applyTimeouts(game, decision.outcome, fetchedMembers);
+        const outcome = decision.outcome;
         const description = outcome.allWinners
             ? allWinnersResultDescription(failedIds.length > 0)
             : ordinaryResultDescription(outcome.selectedIds[0], failedIds.length > 0);
-        await editPublicPanel(game, {
+        const resultUpdated = await editPublicPanel(game, {
             embeds: [makeEmbed(description)],
             components: [],
         }, 'result-panel');
-        game.componentsDisabled = true;
-        game.state = 'ended';
-    });
+        if (resultUpdated) game.componentsDisabled = true;
+    }
 
-    if (ownsSettlement) {
-        await gameManager.cleanupGame(game);
+    await gameManager.cleanupGame(game);
+}
+
+async function finishRecruitment(game) {
+    if (await claimSettlement(game)) {
+        await settleClaimedGame(game);
     }
 }
 
@@ -287,12 +317,14 @@ async function startRoulette(interaction) {
         participantIds: [userId],
         state: 'recruiting',
         resolved: false,
+        pendingJoins: 0,
+        startRequested: false,
         random: Math.random,
         timers: new Set(),
     };
 
     const member = await fetchMember(provisionalGame, userId);
-    if (!member || member.user?.bot) {
+    if (!member?.id || !member.user || member.user.bot) {
         await safeEphemeralReply(interaction, INVALID_MEMBER_MESSAGE, provisionalGame);
         return false;
     }
@@ -328,12 +360,28 @@ async function startRoulette(interaction) {
     game = created.game;
 
     try {
-        await interaction.reply(recruitmentPayload(game));
-        game.message = await interaction.fetchReply();
+        const replyResult = await interaction.reply(recruitmentPayload(game));
+        const replyMessage = replyResult?.resource?.message || replyResult;
+        if (typeof replyMessage?.edit === 'function') {
+            game.message = replyMessage;
+        } else if (typeof interaction.editReply === 'function') {
+            game.message = { edit: payload => interaction.editReply(payload) };
+        }
     } catch (error) {
         logDiscordFailure(game, 'recruitment-panel', error, userId);
         await gameManager.cleanupGame(game);
         return false;
+    }
+
+    try {
+        const fetchedReply = await interaction.fetchReply();
+        if (typeof fetchedReply?.edit === 'function') game.message = fetchedReply;
+    } catch (error) {
+        logDiscordFailure(game, 'fetch-recruitment-panel', error, userId);
+        if (!game.message) {
+            await gameManager.cleanupGame(game);
+            return false;
+        }
     }
 
     game.recruitmentTimer = setTimeout(
@@ -363,58 +411,91 @@ async function handleRouletteInteraction(interaction, parts) {
         return false;
     }
 
-    let startWhenUnlocked = false;
-    let joined = false;
-    await gameManager.runExclusive(game, async () => {
-        const userId = interaction.user?.id;
+    const userId = interaction.user?.id;
+    let rejectionMessage = null;
+    const inspectJoinState = () => {
         if (
             game.ended
             || game.state !== 'recruiting'
             || interaction.channelId !== game.channelId
             || (interaction.guildId || interaction.guild?.id) !== game.guildId
         ) {
-            await safeEphemeralReply(interaction, EXPIRED_MESSAGE, game);
-            return;
+            return EXPIRED_MESSAGE;
         }
         if (game.participantIds.includes(userId)) {
-            await safeEphemeralReply(interaction, DUPLICATE_MESSAGE, game);
-            return;
+            return DUPLICATE_MESSAGE;
         }
         if (game.participantIds.length >= MAX_PARTICIPANTS) {
-            await safeEphemeralReply(interaction, FULL_MESSAGE, game);
-            return;
+            return FULL_MESSAGE;
         }
+        return null;
+    };
 
-        const member = await fetchMember(game, userId);
-        if (!member || member.user?.bot) {
-            await safeEphemeralReply(interaction, INVALID_MEMBER_MESSAGE, game);
-            return;
-        }
+    await gameManager.runExclusive(game, () => {
+        rejectionMessage = inspectJoinState();
+    });
+    if (rejectionMessage) {
+        await safeEphemeralReply(interaction, rejectionMessage, game);
+        return false;
+    }
+
+    const member = await fetchMember(game, userId);
+    if (!member?.id || !member.user || member.user.bot) {
+        await safeEphemeralReply(interaction, INVALID_MEMBER_MESSAGE, game);
+        return false;
+    }
+    if (isActivelyTimedOut(member)) {
+        await safeEphemeralReply(interaction, TIMEOUT_BLOCKED_MESSAGE, game);
+        return false;
+    }
+
+    let joinCommitted = false;
+    await gameManager.runExclusive(game, () => {
+        rejectionMessage = inspectJoinState();
+        if (rejectionMessage) return;
         if (isActivelyTimedOut(member)) {
-            await safeEphemeralReply(interaction, TIMEOUT_BLOCKED_MESSAGE, game);
+            rejectionMessage = TIMEOUT_BLOCKED_MESSAGE;
             return;
         }
         const ownedGame = gameManager.getPlayerGame(game.guildId, userId);
         if (ownedGame && ownedGame !== game) {
-            await safeEphemeralReply(interaction, PLAYER_BUSY_MESSAGE, game);
+            rejectionMessage = PLAYER_BUSY_MESSAGE;
             return;
         }
         if (!gameManager.addPlayer(game, userId)) {
-            await safeEphemeralReply(interaction, PLAYER_BUSY_MESSAGE, game);
+            rejectionMessage = PLAYER_BUSY_MESSAGE;
             return;
         }
+        game.pendingJoins += 1;
+        joinCommitted = true;
+    });
+    if (!joinCommitted) {
+        await safeEphemeralReply(interaction, rejectionMessage || EXPIRED_MESSAGE, game);
+        return false;
+    }
 
-        const panelUpdated = await editPublicPanel(game, recruitmentPayload(game), 'join-count-panel');
+    const panelUpdated = await editPublicPanel(game, recruitmentPayload(game), 'join-count-panel');
+    let joined = false;
+    let startWhenUnlocked = false;
+    await gameManager.runExclusive(game, () => {
+        game.pendingJoins = Math.max(0, game.pendingJoins - 1);
         if (!panelUpdated) {
             gameManager.removePlayer(game, userId);
-            await safeEphemeralReply(interaction, JOIN_FAILURE_MESSAGE, game);
-            return;
+        } else {
+            joined = game.participantIds.includes(userId);
         }
-
-        joined = true;
-        startWhenUnlocked = game.participantIds.length === MAX_PARTICIPANTS;
-        await safeEphemeralReply(interaction, JOINED_MESSAGE, game);
+        startWhenUnlocked = game.pendingJoins === 0
+            && game.state === 'recruiting'
+            && (game.startRequested || game.participantIds.length === MAX_PARTICIPANTS);
     });
+
+    if (!panelUpdated) {
+        await safeEphemeralReply(interaction, JOIN_FAILURE_MESSAGE, game);
+    } else if (!joined) {
+        await safeEphemeralReply(interaction, EXPIRED_MESSAGE, game);
+    } else {
+        await safeEphemeralReply(interaction, JOINED_MESSAGE, game);
+    }
 
     if (startWhenUnlocked) {
         await finishRecruitment(game);
@@ -425,14 +506,16 @@ async function handleRouletteInteraction(interaction, parts) {
 async function handleRouletteMemberInvalidated(game, userId, reason) {
     if (!game || game.type !== 'roulette') return false;
     let removed = false;
-    await gameManager.runExclusive(game, async () => {
+    let refreshRecruitmentPanel = false;
+    await gameManager.runExclusive(game, () => {
         if (game.ended || game.state === 'ended') return;
         removed = gameManager.removePlayer(game, userId);
         if (!removed) return;
-        if (game.state === 'recruiting') {
-            await editPublicPanel(game, recruitmentPayload(game), `member-invalidated-${reason || 'unknown'}`);
-        }
+        refreshRecruitmentPanel = game.state === 'recruiting';
     });
+    if (refreshRecruitmentPanel) {
+        await editPublicPanel(game, recruitmentPayload(game), `member-invalidated-${reason || 'unknown'}`);
+    }
     return removed;
 }
 
