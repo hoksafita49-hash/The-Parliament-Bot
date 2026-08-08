@@ -194,6 +194,46 @@ async function editPublicPanel(game, payload, action) {
     }
 }
 
+function queueRecruitmentPanelEdit(game, action) {
+    const version = (game.recruitmentPanelVersion || 0) + 1;
+    game.recruitmentPanelVersion = version;
+    const payload = recruitmentPayload(game);
+    const previous = game.recruitmentPanelQueue || Promise.resolve();
+    const operation = previous
+        .catch(error => {
+            logDiscordFailure(game, 'recruitment-panel-queue', error);
+        })
+        .then(async () => {
+            if (game.ended || game.state !== 'recruiting') {
+                return { updated: false, stale: true };
+            }
+            return {
+                updated: await editPublicPanel(game, payload, action),
+                stale: false,
+            };
+        })
+        .catch(error => {
+            logDiscordFailure(game, 'recruitment-panel-queue', error);
+            return { updated: false, stale: true };
+        })
+        .finally(() => {
+            game.recruitmentPanelCompletedVersion = Math.max(
+                game.recruitmentPanelCompletedVersion || 0,
+                version
+            );
+        });
+    game.recruitmentPanelQueue = operation;
+    return operation;
+}
+
+async function waitForRecruitmentPanelQueue(game) {
+    try {
+        await game.recruitmentPanelQueue;
+    } catch (error) {
+        logDiscordFailure(game, 'recruitment-panel-queue-wait', error);
+    }
+}
+
 async function fetchValidParticipants(game, participantIds) {
     const validMembers = new Map();
     for (const userId of participantIds) {
@@ -222,23 +262,33 @@ async function applyTimeouts(game, outcome, members) {
 }
 
 async function claimSettlement(game) {
-    let ownsSettlement = false;
-    await gameManager.runExclusive(game, () => {
-        if (game.ended || game.state !== 'recruiting') return;
-        if (game.pendingJoins > 0) {
-            game.startRequested = true;
-            return;
-        }
+    while (true) {
+        const observedPanelVersion = game.recruitmentPanelVersion || 0;
+        await waitForRecruitmentPanelQueue(game);
 
-        game.state = 'starting';
-        ownsSettlement = true;
-        if (game.recruitmentTimer) {
-            clearTimeout(game.recruitmentTimer);
-            game.timers.delete(game.recruitmentTimer);
-            game.recruitmentTimer = null;
-        }
-    });
-    return ownsSettlement;
+        let ownsSettlement = false;
+        let panelQueueAdvanced = false;
+        await gameManager.runExclusive(game, () => {
+            if (game.ended || game.state !== 'recruiting') return;
+            if ((game.recruitmentPanelVersion || 0) !== observedPanelVersion) {
+                panelQueueAdvanced = true;
+                return;
+            }
+            if (game.pendingJoins > 0) {
+                game.startRequested = true;
+                return;
+            }
+
+            game.state = 'starting';
+            ownsSettlement = true;
+            if (game.recruitmentTimer) {
+                clearTimeout(game.recruitmentTimer);
+                game.timers.delete(game.recruitmentTimer);
+                game.recruitmentTimer = null;
+            }
+        });
+        if (!panelQueueAdvanced) return ownsSettlement;
+    }
 }
 
 async function settleClaimedGame(game) {
@@ -319,6 +369,9 @@ async function startRoulette(interaction) {
         resolved: false,
         pendingJoins: 0,
         startRequested: false,
+        recruitmentPanelVersion: 0,
+        recruitmentPanelCompletedVersion: 0,
+        recruitmentPanelQueue: Promise.resolve(),
         random: Math.random,
         timers: new Set(),
     };
@@ -342,6 +395,8 @@ async function startRoulette(interaction) {
     };
     provisionalGame.disableComponents = async () => {
         if (!game || game.componentsDisabled || !game.message) return;
+        await waitForRecruitmentPanelQueue(game);
+        if (game.componentsDisabled) return;
         const disabled = await editPublicPanel(game, {
             components: [joinRow(game.id, true)],
         }, 'disable-components');
@@ -474,7 +529,8 @@ async function handleRouletteInteraction(interaction, parts) {
         return false;
     }
 
-    const panelUpdated = await editPublicPanel(game, recruitmentPayload(game), 'join-count-panel');
+    const panelResult = await queueRecruitmentPanelEdit(game, 'join-count-panel');
+    const panelUpdated = panelResult.updated;
     let joined = false;
     let startWhenUnlocked = false;
     await gameManager.runExclusive(game, () => {
@@ -514,7 +570,7 @@ async function handleRouletteMemberInvalidated(game, userId, reason) {
         refreshRecruitmentPanel = game.state === 'recruiting';
     });
     if (refreshRecruitmentPanel) {
-        await editPublicPanel(game, recruitmentPayload(game), `member-invalidated-${reason || 'unknown'}`);
+        await queueRecruitmentPanelEdit(game, `member-invalidated-${reason || 'unknown'}`);
     }
     return removed;
 }
