@@ -94,8 +94,10 @@ function createBombCooldownStore({ filePath, now = Date.now }) {
 
         try {
             await fs.rename(filePath, backupPath);
+            return true;
         } catch (error) {
             logFailure('backing up malformed cooldown file', error);
+            return false;
         }
     }
 
@@ -134,8 +136,7 @@ function createBombCooldownStore({ filePath, now = Date.now }) {
                 parsedCooldowns = value;
             } catch (error) {
                 logFailure('reading cooldown file', error);
-                await backupMalformedFile();
-                shouldWrite = true;
+                shouldWrite = await backupMalformedFile();
             }
         }
 
