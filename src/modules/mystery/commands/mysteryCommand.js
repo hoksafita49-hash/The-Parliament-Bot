@@ -40,6 +40,7 @@ const TIMEOUT_FAILURE_MESSAGE = '❌ 神秘力量失效了，我无法对你施�
 const NICKNAME_FAILURE_MESSAGE = '❌ 名字取好了，但我改不了你的昵称。\n可能是机器人权限或身份组层级不足。';
 const GENERIC_FAILURE_MESSAGE = '❌ 处理神秘指令时出现错误，请稍后重试。';
 const PLAYER_BUSY_MESSAGE = '🚫 **一心不能二用。**\n你现在已经在一场神秘游戏里，先把那边活着玩完再说。';
+const initiationQueues = new Map();
 
 const NAME_POOL = [
     '我是奶人', '奶奶的龙', '铁血旅程派', '铁血类脑派', '权蛆', 'D喵梦男', 'D喵梦女',
@@ -189,11 +190,33 @@ async function startMultiplayerGame(interaction, subcommand) {
     return startDuel(interaction, interaction.options.getUser('对手'));
 }
 
+async function acquireInitiationLock(guildId, userId) {
+    const key = `${guildId}:${userId}`;
+    const previous = initiationQueues.get(key) || Promise.resolve();
+    let releaseGate;
+    const gate = new Promise(resolve => {
+        releaseGate = resolve;
+    });
+    initiationQueues.set(key, gate);
+    await previous;
+
+    let released = false;
+    return () => {
+        if (released) return;
+        released = true;
+        releaseGate();
+        if (initiationQueues.get(key) === gate) {
+            initiationQueues.delete(key);
+        }
+    };
+}
+
 async function execute(interaction) {
     let guildId = null;
     let userId = interaction.user?.id || 'unknown';
     let subcommand = null;
     let lockAcquired = false;
+    let releaseInitiationLock = null;
     try {
         if (!interaction.inGuild()) {
             await interaction.reply({ content: '❌ 此指令只能在服务器中使用。', flags: MessageFlags.Ephemeral });
@@ -206,17 +229,18 @@ async function execute(interaction) {
         }
         guildId = interaction.guild.id;
         userId = interaction.user.id;
+        lockAcquired = acquireInFlight(guildId, userId, subcommand);
+        if (!lockAcquired) {
+            await interaction.reply({ content: COOLDOWN_MESSAGE, flags: MessageFlags.Ephemeral });
+            return;
+        }
+        releaseInitiationLock = await acquireInitiationLock(guildId, userId);
         if (gameManager.getPlayerGame(guildId, userId)) {
             await interaction.reply({ content: PLAYER_BUSY_MESSAGE, flags: MessageFlags.Ephemeral });
             return;
         }
         const usesInMemoryCooldown = IN_MEMORY_COOLDOWN_SUBCOMMANDS.has(subcommand);
         if (usesInMemoryCooldown && isOnCooldown(guildId, userId, subcommand)) {
-            await interaction.reply({ content: COOLDOWN_MESSAGE, flags: MessageFlags.Ephemeral });
-            return;
-        }
-        lockAcquired = acquireInFlight(guildId, userId, subcommand);
-        if (!lockAcquired) {
             await interaction.reply({ content: COOLDOWN_MESSAGE, flags: MessageFlags.Ephemeral });
             return;
         }
@@ -255,6 +279,7 @@ async function execute(interaction) {
         );
         await replyWithUnexpectedError(interaction);
     } finally {
+        releaseInitiationLock?.();
         if (lockAcquired) releaseInFlight(guildId, userId, subcommand);
     }
 }
