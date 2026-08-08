@@ -145,14 +145,17 @@ async function dispatchMemberInvalidation(member, ...args) {
         return;
     }
 
-    return runExclusive(game, async () => {
-        game.invalidatedMemberIds ||= new Set();
-        if (game.invalidatedMemberIds.has(userId)) {
-            return;
-        }
-        game.invalidatedMemberIds.add(userId);
+    game.invalidatedMemberIds ||= new Set();
+    if (game.invalidatedMemberIds.has(userId)) {
+        return;
+    }
+    game.invalidatedMemberIds.add(userId);
+
+    try {
         await game.onMemberInvalidated?.(member, ...args);
-    });
+    } catch (error) {
+        // Event listeners must not leak callback failures as unhandled rejections.
+    }
 }
 
 function handleGuildMemberRemove(member) {
