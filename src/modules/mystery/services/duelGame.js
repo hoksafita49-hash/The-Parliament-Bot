@@ -16,6 +16,7 @@ const DUEL_TIMEOUT_REASON = '神秘指令：死斗';
 const PLAYER_BUSY_MESSAGE = '🚫 **一心不能二用。**\n你现在已经在一场神秘游戏里，先把那边活着玩完再说。';
 const CHANNEL_BUSY_MESSAGE = '🎮 **这里已经有一场游戏在进行了。**\n等当前游戏结束后再开新的吧。';
 const INVALID_OPPONENT_MESSAGE = '⚔️ **这个对手现在无法参加死斗。**\n换个人再试试吧。';
+const GENERIC_FAILURE_MESSAGE = '❌ 处理神秘指令时出现错误，请稍后重试。';
 const WRONG_INVITEE_MESSAGE = '🚫 **这不是发给你的邀请。**';
 const TIMEOUT_BLOCKED_MESSAGE = '⚔️ **你现在无法参加死斗。**\n你当前还在禁言，暂时无法参加。';
 const INVALID_INITIATOR_MESSAGE = '⚔️ **你现在无法参加死斗。**';
@@ -102,6 +103,35 @@ async function sendPrivate(interaction, payload, game) {
 
 async function safeEphemeralReply(interaction, content, game) {
     return sendPrivate(interaction, { content }, game);
+}
+
+async function deferPublicStart(interaction, game) {
+    if (interaction.deferred || interaction.replied || typeof interaction.deferReply !== 'function') {
+        return false;
+    }
+    try {
+        await interaction.deferReply();
+        return true;
+    } catch (error) {
+        logDiscordFailure(game, 'defer-start-reply', error, interaction.user?.id);
+        return false;
+    }
+}
+
+async function rejectDeferredStart(interaction, content, game) {
+    try {
+        await interaction.deleteReply?.();
+    } catch (error) {
+        logDiscordFailure(game, 'delete-start-reply', error, interaction.user?.id);
+    }
+    try {
+        if (typeof interaction.followUp !== 'function') return false;
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+        return true;
+    } catch (error) {
+        logDiscordFailure(game, 'reject-start-reply', error, interaction.user?.id);
+        return false;
+    }
 }
 
 async function safeEdit(message, payload, game, action) {
@@ -422,6 +452,16 @@ async function applyLoserTimeout(game, snapshot, loser) {
     }
 }
 
+async function appendTimeoutFailure(game, snapshot, finalMessage) {
+    const payload = { embeds: [makeEmbed(finalDescription(game, snapshot, true))] };
+    if (await safeEdit(finalMessage, payload, game, 'append-timeout-shield')) return true;
+    return Boolean(await queuePublicWrite(game, () => safeSend(
+        game,
+        { embeds: [makeEmbed(SHIELD_LINE)] },
+        'supplement-timeout-shield'
+    )));
+}
+
 async function publishRoundResolution(game, snapshot) {
     if (!snapshot) return false;
     if (snapshot.outcome === 'cancel') {
@@ -469,21 +509,22 @@ async function publishRoundResolution(game, snapshot) {
                 || game.round?.id !== snapshot.roundId
                 || game.pendingFinal?.roundId !== snapshot.roundId
                 || game.pendingFinal?.effectToken !== snapshot.effectToken
+                || game.finalEffect
             ) return;
 
             const participantsCurrent = game.participantIds.every(userId => (
                 isCurrentGuildMember(game, finalMembers.get(userId), userId)
             ));
-            game.state = 'ended';
-            game.pendingFinal = null;
             if (!participantsCurrent) {
+                game.state = 'ended';
+                game.pendingFinal = null;
                 game.finalEffect = { token: snapshot.effectToken, phase: 'cancelled' };
                 finalDecision = 'cancel';
                 return;
             }
 
-            game.finalEffect = { token: snapshot.effectToken, phase: 'applying-timeout' };
-            finalDecision = 'apply';
+            game.finalEffect = { token: snapshot.effectToken, phase: 'publishing-result' };
+            finalDecision = 'publish';
         });
         if (!finalDecision) return false;
         if (finalDecision === 'cancel') {
@@ -496,27 +537,73 @@ async function publishRoundResolution(game, snapshot) {
             return false;
         }
 
+        const finalMessage = await queuePublicWrite(game, () => {
+            if (
+                game.ended
+                || game.state !== 'round'
+                || game.round?.id !== snapshot.roundId
+                || game.pendingFinal?.roundId !== snapshot.roundId
+                || game.pendingFinal?.effectToken !== snapshot.effectToken
+                || game.finalEffect?.token !== snapshot.effectToken
+                || game.finalEffect.phase !== 'publishing-result'
+            ) return false;
+            return safeSend(
+                game,
+                { embeds: [makeEmbed(finalDescription(game, snapshot, false))] },
+                'final-result'
+            );
+        });
+        if (finalMessage === false) return false;
+        if (!finalMessage) {
+            await gameManager.runExclusive(game, () => {
+                if (
+                    game.ended
+                    || game.state !== 'round'
+                    || game.pendingFinal?.effectToken !== snapshot.effectToken
+                    || game.finalEffect?.token !== snapshot.effectToken
+                    || game.finalEffect.phase !== 'publishing-result'
+                ) return;
+                game.state = 'ended';
+                game.pendingFinal = null;
+                game.finalEffect.phase = 'publish-failed';
+            });
+            await cleanupDuelGame(game);
+            return false;
+        }
+
+        let applyTimeout = false;
+        await gameManager.runExclusive(game, () => {
+            if (
+                game.ended
+                || game.state !== 'round'
+                || game.round?.id !== snapshot.roundId
+                || game.pendingFinal?.roundId !== snapshot.roundId
+                || game.pendingFinal?.effectToken !== snapshot.effectToken
+                || game.finalEffect?.token !== snapshot.effectToken
+                || game.finalEffect.phase !== 'publishing-result'
+            ) return;
+            game.state = 'ended';
+            game.pendingFinal = null;
+            game.finalEffect.phase = 'applying-timeout';
+            applyTimeout = true;
+        });
+        if (!applyTimeout) {
+            await cleanupDuelGame(game);
+            return false;
+        }
+
         const timeoutApplied = await applyLoserTimeout(
             game,
             snapshot,
             finalMembers.get(snapshot.loserId)
         );
-        if (
-            game.finalEffect?.token === snapshot.effectToken
-            && game.finalEffect.phase === 'applying-timeout'
-        ) {
-            game.finalEffect.phase = 'publishing-result';
-        }
-        const finalMessage = await queuePublicWrite(game, () => safeSend(
-            game,
-            { embeds: [makeEmbed(finalDescription(game, snapshot, !timeoutApplied))] },
-            'final-result'
-        ));
         if (game.finalEffect?.token === snapshot.effectToken) {
-            game.finalEffect.phase = 'complete';
+            game.finalEffect.phase = timeoutApplied ? 'complete' : 'supplementing-result';
         }
+        if (!timeoutApplied) await appendTimeoutFailure(game, snapshot, finalMessage);
+        if (game.finalEffect?.token === snapshot.effectToken) game.finalEffect.phase = 'complete';
         await cleanupDuelGame(game);
-        return Boolean(finalMessage);
+        return true;
     }
 
     let nextRound = null;
@@ -581,9 +668,11 @@ async function startDuel(interaction, requestedOpponent) {
         originInteraction: interaction,
     };
 
+    if (!await deferPublicStart(interaction, provisionalGame)) return false;
+
     const initiator = await safeFetchMember(provisionalGame, userId);
     if (!isCurrentGuildMember(provisionalGame, initiator, userId)) {
-        await safeEphemeralReply(
+        await rejectDeferredStart(
             interaction,
             isActivelyTimedOut(initiator) ? TIMEOUT_BLOCKED_MESSAGE : INVALID_INITIATOR_MESSAGE,
             provisionalGame
@@ -597,7 +686,7 @@ async function startDuel(interaction, requestedOpponent) {
             provisionalGame.requestedOpponentId === userId
             || gameManager.getPlayerGame(guildId, provisionalGame.requestedOpponentId)
         ) {
-            await safeEphemeralReply(interaction, INVALID_OPPONENT_MESSAGE, provisionalGame);
+            await rejectDeferredStart(interaction, INVALID_OPPONENT_MESSAGE, provisionalGame);
             return false;
         }
         opponent = await safeFetchMember(provisionalGame, provisionalGame.requestedOpponentId);
@@ -606,7 +695,7 @@ async function startDuel(interaction, requestedOpponent) {
             opponent,
             provisionalGame.requestedOpponentId
         )) {
-            await safeEphemeralReply(interaction, INVALID_OPPONENT_MESSAGE, provisionalGame);
+            await rejectDeferredStart(interaction, INVALID_OPPONENT_MESSAGE, provisionalGame);
             return false;
         }
     }
@@ -641,13 +730,13 @@ async function startDuel(interaction, requestedOpponent) {
         finalPreflightRejection = INVALID_OPPONENT_MESSAGE;
     }
     if (finalPreflightRejection) {
-        await safeEphemeralReply(interaction, finalPreflightRejection, provisionalGame);
+        await rejectDeferredStart(interaction, finalPreflightRejection, provisionalGame);
         return false;
     }
 
     const created = gameManager.createGame(provisionalGame);
     if (!created.ok) {
-        await safeEphemeralReply(
+        await rejectDeferredStart(
             interaction,
             created.reason === 'player' ? PLAYER_BUSY_MESSAGE : CHANNEL_BUSY_MESSAGE,
             provisionalGame
@@ -657,12 +746,13 @@ async function startDuel(interaction, requestedOpponent) {
     game = created.game;
 
     try {
-        const replyResult = await interaction.reply(invitationPayload(game));
+        const replyResult = await interaction.editReply(invitationPayload(game));
         const responseMessage = replyResult?.resource?.message || replyResult;
         if (typeof responseMessage?.edit === 'function') game.inviteMessage = responseMessage;
     } catch (error) {
         logDiscordFailure(game, 'invitation-panel', error, userId);
         await cleanupDuelGame(game);
+        await rejectDeferredStart(interaction, GENERIC_FAILURE_MESSAGE, game);
         return false;
     }
     if (!game.inviteMessage) {
@@ -678,6 +768,7 @@ async function startDuel(interaction, requestedOpponent) {
     }
     if (!game.inviteMessage) {
         await cleanupDuelGame(game);
+        await rejectDeferredStart(interaction, GENERIC_FAILURE_MESSAGE, game);
         return false;
     }
 

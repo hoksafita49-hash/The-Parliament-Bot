@@ -95,23 +95,31 @@ function runExclusive(game, operation) {
 }
 
 async function cleanupGame(game) {
-    return runExclusive(game, async () => {
+    let ownsCleanup = false;
+    await runExclusive(game, () => {
         if (game.ended) {
             return;
         }
 
         game.ended = true;
+        ownsCleanup = true;
         for (const timer of game.timers) {
             clearTimeout(timer);
         }
         game.timers.clear?.();
+    });
 
-        try {
-            await game.disableComponents?.();
-        } catch (error) {
+    if (!ownsCleanup) return;
+
+    try {
+        void Promise.resolve(game.disableComponents?.()).catch(() => {
             // Component cleanup is best effort; lock release must still occur.
-        }
+        });
+    } catch (error) {
+        // Synchronous component cleanup failures are also best effort.
+    }
 
+    await runExclusive(game, () => {
         game.participantIds.forEach(userId => {
             const playerKey = buildPlayerKey(game.guildId, userId);
             if (playerLocks.get(playerKey) === game.id) {
@@ -134,6 +142,13 @@ function getMemberIds(member) {
     };
 }
 
+function logInvalidationFailure(game, userId, action, error) {
+    console.error(
+        `[MysteryGameManager] ${action} (guild=${game?.guildId || 'unknown'}, user=${userId || 'unknown'}, game=${game?.id || 'unknown'}, type=${game?.type || 'unknown'}):`,
+        error
+    );
+}
+
 async function dispatchMemberInvalidation(member, ...args) {
     const { guildId, userId } = getMemberIds(member);
     if (!guildId || !userId) {
@@ -154,7 +169,12 @@ async function dispatchMemberInvalidation(member, ...args) {
     try {
         await game.onMemberInvalidated?.(member, ...args);
     } catch (error) {
-        // Event listeners must not leak callback failures as unhandled rejections.
+        logInvalidationFailure(game, userId, 'member invalidation callback failed', error);
+        try {
+            await cleanupGame(game);
+        } catch (cleanupError) {
+            logInvalidationFailure(game, userId, 'fallback cleanup failed', cleanupError);
+        }
     }
 }
 

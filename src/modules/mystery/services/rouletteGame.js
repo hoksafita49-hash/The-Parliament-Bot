@@ -139,18 +139,34 @@ function recruitmentPayload(game, disabled = false) {
     };
 }
 
-async function safeEphemeralReply(interaction, content, game) {
-    const payload = { content, flags: MessageFlags.Ephemeral };
+async function deferReply(interaction, payload, game, action) {
     try {
-        if (interaction.deferred || interaction.replied) {
-            if (typeof interaction.followUp === 'function') {
-                await interaction.followUp(payload);
-            }
-        } else if (typeof interaction.reply === 'function') {
-            await interaction.reply(payload);
-        }
+        await interaction.deferReply(payload);
+        return true;
     } catch (error) {
-        logDiscordFailure(game, 'ephemeral-reply', error, interaction.user?.id);
+        logDiscordFailure(game, action, error, interaction.user?.id);
+        return false;
+    }
+}
+
+async function replacePublicDeferWithEphemeral(interaction, content, game) {
+    try {
+        await interaction.deleteReply();
+    } catch (error) {
+        logDiscordFailure(game, 'delete-public-defer', error, interaction.user?.id);
+    }
+    try {
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+    } catch (error) {
+        logDiscordFailure(game, 'ephemeral-follow-up', error, interaction.user?.id);
+    }
+}
+
+async function safeDeferredReplyEdit(interaction, content, game) {
+    try {
+        await interaction.editReply({ content });
+    } catch (error) {
+        logDiscordFailure(game, 'ephemeral-edit-reply', error, interaction.user?.id);
     }
 }
 
@@ -372,16 +388,27 @@ async function settleClaimedGame(game) {
         }, 'cancel-panel');
         if (cancellationUpdated) game.componentsDisabled = true;
     } else {
-        const failedIds = await applyTimeouts(game, decision.outcome, fetchedMembers);
         const outcome = decision.outcome;
         const description = outcome.allWinners
-            ? allWinnersResultDescription(failedIds.length > 0)
-            : ordinaryResultDescription(outcome.selectedIds[0], failedIds.length > 0);
+            ? allWinnersResultDescription(false)
+            : ordinaryResultDescription(outcome.selectedIds[0], false);
         const resultUpdated = await editPublicPanel(game, {
             embeds: [makeEmbed(description)],
             components: [],
         }, 'result-panel');
-        if (resultUpdated) game.componentsDisabled = true;
+        if (resultUpdated) {
+            game.componentsDisabled = true;
+            const failedIds = await applyTimeouts(game, outcome, fetchedMembers);
+            if (failedIds.length > 0) {
+                const correctedDescription = outcome.allWinners
+                    ? allWinnersResultDescription(true)
+                    : ordinaryResultDescription(outcome.selectedIds[0], true);
+                await editPublicPanel(game, {
+                    embeds: [makeEmbed(correctedDescription)],
+                    components: [],
+                }, 'result-timeout-failure-panel');
+            }
+        }
     }
 
     await cleanupRouletteGame(game);
@@ -416,13 +443,17 @@ async function startRoulette(interaction) {
         timers: new Set(),
     };
 
+    if (!await deferReply(interaction, undefined, provisionalGame, 'defer-recruitment')) {
+        return false;
+    }
+
     const member = await fetchMember(provisionalGame, userId);
     if (!member?.id || !member.user || member.user.bot) {
-        await safeEphemeralReply(interaction, INVALID_MEMBER_MESSAGE, provisionalGame);
+        await replacePublicDeferWithEphemeral(interaction, INVALID_MEMBER_MESSAGE, provisionalGame);
         return false;
     }
     if (isActivelyTimedOut(member)) {
-        await safeEphemeralReply(interaction, TIMEOUT_BLOCKED_MESSAGE, provisionalGame);
+        await replacePublicDeferWithEphemeral(interaction, TIMEOUT_BLOCKED_MESSAGE, provisionalGame);
         return false;
     }
 
@@ -439,7 +470,7 @@ async function startRoulette(interaction) {
 
     const created = gameManager.createGame(provisionalGame);
     if (!created.ok) {
-        await safeEphemeralReply(
+        await replacePublicDeferWithEphemeral(
             interaction,
             created.reason === 'player' ? PLAYER_BUSY_MESSAGE : CHANNEL_BUSY_MESSAGE,
             provisionalGame
@@ -449,7 +480,7 @@ async function startRoulette(interaction) {
     game = created.game;
 
     try {
-        const replyResult = await interaction.reply(recruitmentPayload(game));
+        const replyResult = await interaction.editReply(recruitmentPayload(game));
         const replyMessage = replyResult?.resource?.message || replyResult;
         if (typeof replyMessage?.edit === 'function') {
             game.message = replyMessage;
@@ -459,6 +490,7 @@ async function startRoulette(interaction) {
     } catch (error) {
         logDiscordFailure(game, 'recruitment-panel', error, userId);
         await cleanupRouletteGame(game);
+        await replacePublicDeferWithEphemeral(interaction, JOIN_FAILURE_MESSAGE, game);
         return false;
     }
 
@@ -493,10 +525,19 @@ function parseJoinParts(parts) {
 }
 
 async function handleRouletteInteraction(interaction, parts) {
+    if (!await deferReply(
+        interaction,
+        { flags: MessageFlags.Ephemeral },
+        null,
+        'defer-join'
+    )) {
+        return false;
+    }
+
     const gameId = parseJoinParts(parts);
     const game = gameId && gameManager.getGame(gameId);
     if (!game || game.type !== 'roulette') {
-        await safeEphemeralReply(interaction, EXPIRED_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, EXPIRED_MESSAGE, game);
         return false;
     }
 
@@ -524,17 +565,17 @@ async function handleRouletteInteraction(interaction, parts) {
         rejectionMessage = inspectJoinState();
     });
     if (rejectionMessage) {
-        await safeEphemeralReply(interaction, rejectionMessage, game);
+        await safeDeferredReplyEdit(interaction, rejectionMessage, game);
         return false;
     }
 
     const member = await fetchMember(game, userId);
     if (!member?.id || !member.user || member.user.bot) {
-        await safeEphemeralReply(interaction, INVALID_MEMBER_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, INVALID_MEMBER_MESSAGE, game);
         return false;
     }
     if (isActivelyTimedOut(member)) {
-        await safeEphemeralReply(interaction, TIMEOUT_BLOCKED_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, TIMEOUT_BLOCKED_MESSAGE, game);
         return false;
     }
 
@@ -559,7 +600,7 @@ async function handleRouletteInteraction(interaction, parts) {
         joinCommitted = true;
     });
     if (!joinCommitted) {
-        await safeEphemeralReply(interaction, rejectionMessage || EXPIRED_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, rejectionMessage || EXPIRED_MESSAGE, game);
         return false;
     }
 
@@ -583,11 +624,11 @@ async function handleRouletteInteraction(interaction, parts) {
     const panelUpdated = panelResult.updated;
 
     if (!panelUpdated) {
-        await safeEphemeralReply(interaction, JOIN_FAILURE_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, JOIN_FAILURE_MESSAGE, game);
     } else if (!joined) {
-        await safeEphemeralReply(interaction, EXPIRED_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, EXPIRED_MESSAGE, game);
     } else {
-        await safeEphemeralReply(interaction, JOINED_MESSAGE, game);
+        await safeDeferredReplyEdit(interaction, JOINED_MESSAGE, game);
     }
 
     if (startWhenUnlocked) {
