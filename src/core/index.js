@@ -167,6 +167,8 @@ const openDoorCommand = require('../modules/safetySetup/commands/openDoor');
 
 // 神秘指令娱乐系统
 const mysteryCommand = require('../modules/mystery/commands/mysteryCommand');
+const { mysteryGuildMemberRemoveHandler } = require('../modules/mystery/events/guildMemberRemove');
+const { mysteryGuildMemberUpdateHandler } = require('../modules/mystery/events/guildMemberUpdate');
 
 const DISCORD_REST_TIMEOUT_MS = (() => {
     const n = Number(process.env.DISCORD_REST_TIMEOUT_MS);
@@ -414,6 +416,8 @@ client.on(Events.GuildMemberAdd, controlledInviteGuildMemberAddHandler);
 client.on(Events.GuildMemberRemove, roleSyncGuildMemberRemoveHandler);
 client.on(Events.GuildMemberUpdate, roleSyncGuildMemberUpdateHandler);
 client.on(Events.GuildRoleDelete, roleSyncGuildRoleDeleteHandler);
+client.on(Events.GuildMemberRemove, mysteryGuildMemberRemoveHandler);
+client.on(Events.GuildMemberUpdate, mysteryGuildMemberUpdateHandler);
 
 function normalizeDiscordToken(raw) {
     if (!raw) return '';
