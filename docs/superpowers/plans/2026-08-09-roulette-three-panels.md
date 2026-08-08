@@ -29,7 +29,7 @@
 - Consumes: `gameManager.runExclusive(game, callback)`、`gameManager.cleanupGame(game)`、Discord `interaction.channel.send(payload)` 和 `Message.edit(payload)`。
 - Produces: `game.message` 继续只指向招募消息；`sendPublicPanel(game, payload, action)` 返回已发送的 Discord Message 或 `null`。
 
-- [ ] **Step 1: 扩充测试夹具的公开频道**
+- [x] **Step 1: 扩充测试夹具的公开频道**
 
 在 `createFixture()` 中加入一个真实记录 payload 的 fake channel，并由 start interaction 暴露它：
 
@@ -68,7 +68,7 @@ return {
 };
 ```
 
-- [ ] **Step 2: 写三个面板的失败测试**
+- [x] **Step 2: 写三个面板的失败测试**
 
 新增行为测试，触发三人招募结束后检查：招募消息最后一次编辑只禁用组件，不含开局或结果 embed；`channelMessages` 恰好为开局、结果两条；开局描述逐一包含 `<@u1>`、`<@u2>`、`<@u3>` 且顺序正确；结果描述包含被选中的 mention。
 
@@ -83,20 +83,21 @@ test('keeps recruitment, participant start, and result as three separate public 
 });
 ```
 
-- [ ] **Step 3: 运行定向测试并确认 RED**
+- [x] **Step 3: 运行定向测试并确认 RED**
 
 Run: `node --test --test-name-pattern="three separate public panels" local-tests/rouletteGame.test.js`
 
 Expected: FAIL，因为当前开局和结果都会编辑 `game.message`，不会调用 `channel.send`。
 
-- [ ] **Step 4: 写面板发送失败和修订归属测试**
+- [x] **Step 4: 写面板发送失败和修订归属测试**
 
-新增四个测试：
+新增四个测试，并把现有“结果发布失败”测试改为针对独立结果消息：
 
 1. 开局面板 `channel.send` 拒绝时，随机函数未调用、无人被 Timeout、游戏锁已释放。
 2. 结果面板 `channel.send` 拒绝时，无人被 Timeout、游戏锁已释放。
 3. Timeout 拒绝时，只编辑结果消息，招募消息不出现护盾提示。
 4. 开局面板发送阻塞期间成员失效并导致人数不足时，不发送结果、不执行 Timeout，并清理游戏锁。
+5. 开局面板发送阻塞期间 manager cleanup 时，结算只检查一次中止状态并正常返回，不进入循环。
 
 ```js
 test('a failed participant panel publish skips draw and timeout', async () => {
@@ -108,13 +109,13 @@ test('a failed participant panel publish skips draw and timeout', async () => {
 });
 ```
 
-- [ ] **Step 5: 运行新增失败路径测试并确认 RED**
+- [x] **Step 5: 运行新增失败路径测试并确认 RED**
 
 Run: `node --test --test-name-pattern="participant panel|result panel|edits only the result|invalidated during participant" local-tests/rouletteGame.test.js`
 
 Expected: FAIL，当前没有独立频道消息和独立结果 Message 引用。
 
-- [ ] **Step 6: 实现安全发送和新文案**
+- [x] **Step 6: 实现安全发送和新文案**
 
 在 `rouletteGame.js` 中：
 
@@ -150,7 +151,7 @@ async function sendPublicPanel(game, payload, action) {
 
 在 provisional game 保存 `channel: interaction.channel`。不改变 `game.message` 的招募消息语义。
 
-- [ ] **Step 7: 重排结算消息生命周期**
+- [x] **Step 7: 重排结算消息生命周期**
 
 修改 `settleClaimedGame(game)`：
 
@@ -162,13 +163,13 @@ async function sendPublicPanel(game, payload, action) {
 6. 面板 3 发布成功后调用 `applyTimeouts`。
 7. Timeout 失败时调用返回结果 Message 的 `edit`，不调用只面向招募消息的 `editPublicPanel`。
 
-- [ ] **Step 8: 运行轮盘完整测试并修订旧契约断言**
+- [x] **Step 8: 运行轮盘完整测试并修订旧契约断言**
 
 Run: `node --test local-tests/rouletteGame.test.js`
 
 Expected: 全部 PASS。只把断言从“同一消息被改写”为“三条消息各司其职”，不得放宽并发、先发布后 Timeout、失败 cleanup 和成员失效断言。
 
-- [ ] **Step 9: 运行全部本地测试和语法检查**
+- [x] **Step 9: 运行全部本地测试和语法检查**
 
 Run: `$tests = Get-ChildItem local-tests -Filter *.test.js | ForEach-Object FullName; node --test $tests`
 
@@ -182,14 +183,14 @@ Run: `git diff --check`
 
 Expected: exit 0。
 
-- [ ] **Step 10: 提交生产代码和回归测试**
+- [x] **Step 10: 提交生产代码，保留本地回归测试**
 
 ```bash
-git add src/modules/mystery/services/rouletteGame.js local-tests/rouletteGame.test.js
+git add src/modules/mystery/services/rouletteGame.js docs/superpowers/plans/2026-08-09-roulette-three-panels.md
 git commit -m "feat(mystery): split roulette into three panels"
 ```
 
-提交前确认没有暂存 `.env`、冷却数据、日志或代理辅助文件。
+`local-tests/` 沿用本分支既有约定保留为未跟踪本地验证资产，不进入 PR。提交前确认没有暂存 `.env`、冷却数据、日志或代理辅助文件。
 
 ### Task 2: 重启并验证本地 Bot
 
@@ -200,7 +201,7 @@ git commit -m "feat(mystery): split roulette into three panels"
 - Consumes: ignored `.env`、ignored local proxy bootstrap、Clash `127.0.0.1:7890`。
 - Produces: 一个新的本地 Node Bot 进程和新启动日志。
 
-- [ ] **Step 1: 停止旧 Bot 进程**
+- [x] **Step 1: 停止旧 Bot 进程**
 
 先核对 PID 23464 的 command line 指向本 worktree，再执行：
 
@@ -208,10 +209,10 @@ git commit -m "feat(mystery): split roulette into three panels"
 Stop-Process -Id 23464
 ```
 
-- [ ] **Step 2: 用现有本地代理启动器重新启动**
+- [x] **Step 2: 用现有本地代理启动器重新启动**
 
 从 worktree 运行 ignored 的 `local-start-proxied.cmd`，将 stdout/stderr 写入新的本地部署日志；不得打印 `.env` 内容。
 
-- [ ] **Step 3: 验证登录和命令状态**
+- [x] **Step 3: 验证登录和命令状态**
 
 检查新 Node PID、日志中的 `Ready`/登录成功和命令注册成功；stderr 不得出现未处理异常。最后向用户报告 PID、停止命令和 Discord 人工测试步骤，不创建 PR。

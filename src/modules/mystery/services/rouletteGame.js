@@ -61,11 +61,15 @@ function cancellationDescription() {
     ].join('\n');
 }
 
-function startingDescription(count) {
+function startingDescription(participantIds) {
+    const mentions = participantIds.map(userId => `<@${userId}>`).join('、');
     return [
         '🎰 **轮盘开始转动……**',
         '',
-        `本局共有 **${count} 名玩家**。`,
+        '**本局参与者：**',
+        mentions,
+        '',
+        `本局共有 **${participantIds.length} 名玩家**。`,
         '',
         '正在从各位勇士之中挑选幸运儿……',
         '',
@@ -200,13 +204,27 @@ function drawRouletteOutcome(participantIds, random = Math.random) {
 }
 
 async function editPublicPanel(game, payload, action) {
-    if (!game.message || typeof game.message.edit !== 'function') return false;
+    return editMessage(game, game.message, payload, action);
+}
+
+async function editMessage(game, message, payload, action) {
+    if (!message || typeof message.edit !== 'function') return false;
     try {
-        await game.message.edit(payload);
+        await message.edit(payload);
         return true;
     } catch (error) {
         logDiscordFailure(game, action, error);
         return false;
+    }
+}
+
+async function sendPublicPanel(game, payload, action) {
+    if (!game.channel || typeof game.channel.send !== 'function') return null;
+    try {
+        return await game.channel.send(payload);
+    } catch (error) {
+        logDiscordFailure(game, action, error);
+        return null;
     }
 }
 
@@ -348,11 +366,7 @@ async function claimSettlement(game) {
 }
 
 async function settleClaimedGame(game) {
-    const startingPanelUpdated = await editPublicPanel(game, {
-        embeds: [makeEmbed(startingDescription(game.participantIds.length))],
-        components: [joinRow(game.id, true)],
-    }, 'starting-panel');
-    if (startingPanelUpdated) game.componentsDisabled = true;
+    await scheduleComponentDisable(game);
 
     const participantSnapshot = [...game.participantIds];
     const fetchedMembers = await fetchValidParticipants(game, participantSnapshot);
@@ -373,11 +387,7 @@ async function settleClaimedGame(game) {
             return;
         }
 
-        const outcome = drawRouletteOutcome(participantIds, game.random);
-        game.outcome = outcome;
-        game.resolved = true;
-        game.state = 'ended';
-        decision = { cancelled: false, outcome };
+        decision = { cancelled: false, participantIds };
     });
 
     if (!decision) return;
@@ -388,22 +398,87 @@ async function settleClaimedGame(game) {
         }, 'cancel-panel');
         if (cancellationUpdated) game.componentsDisabled = true;
     } else {
-        const outcome = decision.outcome;
+        let publishedParticipantIds = decision.participantIds;
+        const startingMessage = await sendPublicPanel(game, {
+            embeds: [makeEmbed(startingDescription(publishedParticipantIds))],
+            components: [],
+        }, 'starting-panel');
+        if (!startingMessage) {
+            await cleanupRouletteGame(game);
+            return;
+        }
+
+        let outcome = null;
+        let cancelledDuringPublish = false;
+        let settlementAborted = false;
+        while (!outcome && !cancelledDuringPublish && !settlementAborted) {
+            let refreshedParticipantIds = null;
+            await gameManager.runExclusive(game, () => {
+                if (game.ended || game.state !== 'starting' || game.resolved) {
+                    settlementAborted = true;
+                    return;
+                }
+                const currentParticipantIds = game.participantIds.filter(
+                    userId => fetchedMembers.has(userId)
+                );
+                if (currentParticipantIds.length < MIN_PARTICIPANTS) {
+                    game.state = 'ended';
+                    cancelledDuringPublish = true;
+                    return;
+                }
+                if (
+                    currentParticipantIds.length !== publishedParticipantIds.length
+                    || currentParticipantIds.some(
+                        (userId, index) => userId !== publishedParticipantIds[index]
+                    )
+                ) {
+                    refreshedParticipantIds = currentParticipantIds;
+                    return;
+                }
+
+                outcome = drawRouletteOutcome(currentParticipantIds, game.random);
+                game.outcome = outcome;
+                game.resolved = true;
+                game.state = 'ended';
+            });
+
+            if (refreshedParticipantIds) {
+                const refreshed = await editMessage(game, startingMessage, {
+                    embeds: [makeEmbed(startingDescription(refreshedParticipantIds))],
+                    components: [],
+                }, 'refresh-starting-panel');
+                if (!refreshed) break;
+                publishedParticipantIds = refreshedParticipantIds;
+            }
+        }
+
+        if (cancelledDuringPublish) {
+            await editMessage(game, startingMessage, {
+                embeds: [makeEmbed(cancellationDescription())],
+                components: [],
+            }, 'cancel-starting-panel');
+            await cleanupRouletteGame(game);
+            return;
+        }
+        if (!outcome) {
+            await cleanupRouletteGame(game);
+            return;
+        }
+
         const description = outcome.allWinners
             ? allWinnersResultDescription(false)
             : ordinaryResultDescription(outcome.selectedIds[0], false);
-        const resultUpdated = await editPublicPanel(game, {
+        const resultMessage = await sendPublicPanel(game, {
             embeds: [makeEmbed(description)],
             components: [],
         }, 'result-panel');
-        if (resultUpdated) {
-            game.componentsDisabled = true;
+        if (resultMessage) {
             const failedIds = await applyTimeouts(game, outcome, fetchedMembers);
             if (failedIds.length > 0) {
                 const correctedDescription = outcome.allWinners
                     ? allWinnersResultDescription(true)
                     : ordinaryResultDescription(outcome.selectedIds[0], true);
-                await editPublicPanel(game, {
+                await editMessage(game, resultMessage, {
                     embeds: [makeEmbed(correctedDescription)],
                     components: [],
                 }, 'result-timeout-failure-panel');
@@ -429,6 +504,7 @@ async function startRoulette(interaction) {
         type: 'roulette',
         guildId,
         channelId,
+        channel: interaction.channel,
         guild: interaction.guild,
         initiatorId: userId,
         participantIds: [userId],
