@@ -1,0 +1,347 @@
+// src\modules\selfModeration\services\reactionTracker.js
+const { updateSelfModerationVote, getSelfModerationBlacklist } = require('../../../core/utils/database');
+const { DELETE_THRESHOLD, MUTE_DURATIONS, calculateLinearMuteDuration, isDayTime } = require('../../../core/config/timeconfig');
+
+/**
+ * 检查消息是否存在
+ * @param {Client} client - Discord客户端
+ * @param {string} channelId - 频道ID
+ * @param {string} messageId - 消息ID
+ * @returns {boolean} 消息是否存在
+ */
+async function checkMessageExists(client, channelId, messageId) {
+    try {
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) {
+            console.log(`频道 ${channelId} 不存在`);
+            return false;
+        }
+        
+        const message = await channel.messages.fetch(messageId);
+        return !!message;
+        
+    } catch (error) {
+        // 如果获取消息失败，通常意味着消息已被删除
+        console.log(`消息 ${messageId} 不存在或无法访问: ${error.message}`);
+        return false;
+    }
+}
+
+/**
+ * 根据投票类型获取对应的表情符号
+ * @param {string} type - 投票类型 ('delete' 或 'mute')
+ * @returns {Array<string>} 表情符号数组
+ */
+function getVoteEmojis(type) {
+    if (type === 'delete') {
+        // 删除投票使用⚠️表情
+        return ['⚠️', '⚠', 'warning', ':warning:'];
+    } else if (type === 'mute' || type === 'serious_mute') {
+        // 禁言投票与严肃禁言复用🚫表情
+        return ['🚫', '🚯', 'no_entry_sign', ':no_entry_sign:'];
+    }
+    
+    // 默认返回⚠️表情（向后兼容）
+    return ['⚠️', '⚠', 'warning', ':warning:'];
+}
+
+/**
+ * 获取消息的投票反应用户列表（支持不同投票类型，排除黑名单用户）
+ * @param {Client} client - Discord客户端
+ * @param {string} channelId - 频道ID
+ * @param {string} messageId - 消息ID
+ * @param {string} type - 投票类型 ('delete' 或 'mute')
+ * @param {string} guildId - 服务器ID（用于黑名单检查）
+ * @returns {Set<string>} 用户ID集合
+ */
+async function getVoteReactionUsers(client, channelId, messageId, type = 'delete', guildId = null) {
+    try {
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) {
+            console.error(`找不到频道: ${channelId}`);
+            return new Set();
+        }
+        
+        const message = await channel.messages.fetch(messageId);
+        if (!message) {
+            console.error(`找不到消息: ${messageId}`);
+            return new Set();
+        }
+        
+        // 根据投票类型获取对应的表情符号
+        const emojis = getVoteEmojis(type);
+        
+        // 查找对应的反应
+        const voteReaction = message.reactions.cache.find(reaction => {
+            return emojis.some(emoji => 
+                reaction.emoji.name === emoji || 
+                reaction.emoji.unicode === emoji ||
+                (emoji.startsWith(':') && emoji.endsWith(':') && reaction.emoji.name === emoji.slice(1, -1))
+            );
+        });
+        
+        if (!voteReaction) {
+            const emojiText = (type === 'mute' || type === 'serious_mute') ? '🚫' : '⚠️';
+            console.log(`消息 ${messageId} 没有${emojiText}反应`);
+            return new Set();
+        }
+        
+        // 获取所有添加了反应的用户
+        const users = await voteReaction.users.fetch();
+        const userIds = new Set();
+        
+        // 获取黑名单（如果提供了 guildId）
+        let blacklist = {};
+        if (guildId) {
+            blacklist = await getSelfModerationBlacklist(guildId);
+        }
+        
+        users.forEach(user => {
+            if (!user.bot) { // 排除机器人
+                // 检查用户是否在黑名单中
+                if (guildId && blacklist[user.id]) {
+                    // 检查黑名单是否已过期
+                    const entry = blacklist[user.id];
+                    if (entry.expiresAt) {
+                        const now = new Date();
+                        const expiryDate = new Date(entry.expiresAt);
+                        if (now < expiryDate) {
+                            // 未过期，排除此用户
+                            console.log(`排除黑名单用户的投票: ${user.tag} (${user.id})`);
+                            return;
+                        }
+                    } else {
+                        // 永久封禁，排除此用户
+                        console.log(`排除黑名单用户的投票: ${user.tag} (${user.id})`);
+                        return;
+                    }
+                }
+                userIds.add(user.id);
+            }
+        });
+        
+        const emojiText = (type === 'mute' || type === 'serious_mute') ? '🚫' : '⚠️';
+        console.log(`消息 ${messageId} 的${emojiText}反应用户数量: ${userIds.size}`);
+        return userIds;
+        
+    } catch (error) {
+        const emojiText = (type === 'mute' || type === 'serious_mute') ? '🚫' : '⚠️';
+        console.error(`获取${emojiText}反应用户时出错:`, error);
+        return new Set();
+    }
+}
+
+/**
+ * 获取目标消息和投票公告的反应数量（去重后）
+ * @param {Client} client - Discord客户端
+ * @param {object} voteData - 投票数据
+ * @returns {object} {uniqueUsers: Set, totalCount: number, targetMessageExists: boolean}
+ */
+async function getDeduplicatedReactionCount(client, voteData) {
+    try {
+        const { 
+            guildId, 
+            targetChannelId, 
+            targetMessageId, 
+            voteAnnouncementChannelId, 
+            voteAnnouncementMessageId,
+            type
+        } = voteData;
+        
+        // 检查目标消息是否存在
+        const targetMessageExists = await checkMessageExists(client, targetChannelId, targetMessageId);
+        console.log(`目标消息 ${targetMessageId} 是否存在: ${targetMessageExists}`);
+        
+        // 初始化用户集合
+        const allUsers = new Set();
+        
+        // 如果目标消息存在，获取其反应用户（传入 guildId 以进行黑名单过滤）
+        if (targetMessageExists) {
+            const targetUsers = await getVoteReactionUsers(client, targetChannelId, targetMessageId, type, guildId);
+            console.log(`目标消息反应用户（排除黑名单后）: ${targetUsers.size}`);
+            targetUsers.forEach(userId => allUsers.add(userId));
+        } else {
+            console.log(`目标消息不存在，跳过目标消息反应统计`);
+        }
+        
+        // 获取投票公告的反应用户（投票公告应该始终存在，传入 guildId 以进行黑名单过滤）
+        if (voteAnnouncementMessageId && voteAnnouncementChannelId) {
+            const announcementUsers = await getVoteReactionUsers(client, voteAnnouncementChannelId, voteAnnouncementMessageId, type, guildId);
+            console.log(`投票公告反应用户（排除黑名单后）: ${announcementUsers.size}`);
+            announcementUsers.forEach(userId => allUsers.add(userId));
+        }
+        
+        console.log(`去重后总反应用户数: ${allUsers.size}`);
+        
+        return {
+            uniqueUsers: allUsers,
+            totalCount: allUsers.size,
+            targetMessageExists
+        };
+        
+    } catch (error) {
+        console.error('获取去重后反应数量时出错:', error);
+        return {
+            uniqueUsers: new Set(),
+            totalCount: 0,
+            targetMessageExists: false
+        };
+    }
+}
+
+/**
+ * 获取目标消息的⚠️反应数量（兼容旧函数）
+ * @param {Client} client - Discord客户端
+ * @param {string} guildId - 服务器ID
+ * @param {string} channelId - 频道ID
+ * @param {string} messageId - 消息ID
+ * @returns {number} ⚠️反应数量
+ */
+async function getShitReactionCount(client, guildId, channelId, messageId) {
+    try {
+        const users = await getVoteReactionUsers(client, channelId, messageId, 'delete', guildId);
+        return users.size;
+    } catch (error) {
+        console.error('获取⚠️反应数量时出错:', error);
+        return 0;
+    }
+}
+
+/**
+ * 更新投票的反应数量（使用去重逻辑）
+ * @param {Client} client - Discord客户端
+ * @param {object} voteData - 投票数据
+ * @returns {object|null} 更新后的投票数据
+ */
+async function updateVoteReactionCountWithDeduplication(client, voteData) {
+    try {
+        const { guildId, targetMessageId, type } = voteData;
+        
+        // 获取去重后的反应数量
+        const reactionResult = await getDeduplicatedReactionCount(client, voteData);
+        const newCount = reactionResult.totalCount;
+        const targetMessageExists = reactionResult.targetMessageExists;
+        
+        // 更新数据库
+        const updated = await updateSelfModerationVote(guildId, targetMessageId, type, {
+            lastReactionCount: newCount,
+            currentReactionCount: newCount,
+            lastChecked: new Date().toISOString(),
+            uniqueUserCount: newCount,
+            targetMessageExists: targetMessageExists // 记录目标消息是否存在
+        });
+        
+        console.log(`更新投票 ${guildId}_${targetMessageId}_${type} 反应数量: ${newCount}, 目标消息存在: ${targetMessageExists}`);
+        return updated;
+        
+    } catch (error) {
+        console.error('更新投票反应数量时出错:', error);
+        return null;
+    }
+}
+
+/**
+ * 批量检查多个投票的反应数量（使用去重逻辑）
+ * @param {Client} client - Discord客户端
+ * @param {Array} votes - 投票数组
+ * @returns {Array} 更新后的投票数组
+ */
+async function batchCheckReactions(client, votes) {
+    const updatedVotes = [];
+    
+    for (const vote of votes) {
+        try {
+            // 使用新的去重反应计数方法
+            const reactionResult = await getDeduplicatedReactionCount(client, vote);
+            const currentCount = reactionResult.totalCount;
+            
+            // 如果反应数量有变化，更新数据库
+            if (currentCount !== vote.currentReactionCount) {
+                const updatedVote = await updateVoteReactionCountWithDeduplication(client, vote);
+                if (updatedVote) {
+                    updatedVotes.push(updatedVote);
+                } else {
+                    // 如果更新失败，至少更新内存中的数据
+                    vote.currentReactionCount = currentCount;
+                    updatedVotes.push(vote);
+                }
+            } else {
+                updatedVotes.push(vote);
+            }
+            
+        } catch (error) {
+            console.error(`检查投票 ${vote.guildId}_${vote.targetMessageId}_${vote.type} 的反应时出错:`, error);
+            updatedVotes.push(vote);
+        }
+    }
+    
+    return updatedVotes;
+}
+
+/**
+ * 检查反应数量是否达到阈值
+ * @param {number} reactionCount - 反应数量
+ * @param {string} type - 投票类型 ('delete' 或 'mute')
+ * @returns {object} {reached: boolean, threshold: number, action: string}
+ */
+function checkReactionThreshold(reactionCount, type) {
+    if (type === 'delete') {
+        return {
+            reached: reactionCount >= DELETE_THRESHOLD,
+            threshold: DELETE_THRESHOLD,
+            action: '删除消息'
+        };
+    } else if (type === 'mute') {
+        // 🔥 使用新的线性禁言阈值计算
+        const isNight = isDayTime() === false;
+        const muteInfo = calculateLinearMuteDuration(reactionCount, isNight);
+        
+        return {
+            reached: muteInfo.shouldMute,
+            threshold: muteInfo.threshold,
+            action: '禁言用户'
+        };
+    } else if (type === 'serious_mute') {
+        // 严肃禁言：基于动态 Level 1 阈值 × 1.5 向上取整
+        const base0 = MUTE_DURATIONS.LEVEL_1.threshold;
+        const base = Math.ceil(base0 * 1.5);
+        return {
+            reached: reactionCount >= base,
+            threshold: base,
+            action: '严肃禁言'
+        };
+    }
+    
+    return {
+        reached: false,
+        threshold: 0,
+        action: '未知操作'
+    };
+}
+
+/**
+ * 获取反应数量变化的描述
+ * @param {number} oldCount - 旧的反应数量
+ * @param {number} newCount - 新的反应数量
+ * @returns {string} 变化描述
+ */
+function getReactionChangeDescription(oldCount, newCount) {
+    if (newCount > oldCount) {
+        return `⚠️反应增加了 ${newCount - oldCount} 个 (${oldCount} → ${newCount})`;
+    } else if (newCount < oldCount) {
+        return `⚠️反应减少了 ${oldCount - newCount} 个 (${oldCount} → ${newCount})`;
+    } else {
+        return `⚠️反应数量没有变化 (${newCount})`;
+    }
+}
+
+module.exports = {
+    getShitReactionCount,
+    getVoteReactionUsers,
+    getDeduplicatedReactionCount,
+    updateVoteReactionCountWithDeduplication,
+    checkMessageExists,
+    checkReactionThreshold,
+    batchCheckReactions,
+    getReactionChangeDescription
+};
