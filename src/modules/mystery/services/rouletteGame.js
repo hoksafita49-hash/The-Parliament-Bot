@@ -194,23 +194,26 @@ async function editPublicPanel(game, payload, action) {
     }
 }
 
-function queueRecruitmentPanelEdit(game, action) {
+function queueRecruitmentPanelEdit(game, action, finalize) {
     const version = (game.recruitmentPanelVersion || 0) + 1;
     game.recruitmentPanelVersion = version;
-    const payload = recruitmentPayload(game);
     const previous = game.recruitmentPanelQueue || Promise.resolve();
     const operation = previous
         .catch(error => {
             logDiscordFailure(game, 'recruitment-panel-queue', error);
         })
         .then(async () => {
+            let result;
             if (game.ended || game.state !== 'recruiting') {
-                return { updated: false, stale: true };
+                result = { updated: false, stale: true };
+            } else {
+                result = {
+                    updated: await editPublicPanel(game, recruitmentPayload(game), action),
+                    stale: false,
+                };
             }
-            return {
-                updated: await editPublicPanel(game, payload, action),
-                stale: false,
-            };
+            await finalize?.(result);
+            return result;
         })
         .catch(error => {
             logDiscordFailure(game, 'recruitment-panel-queue', error);
@@ -232,6 +235,43 @@ async function waitForRecruitmentPanelQueue(game) {
     } catch (error) {
         logDiscordFailure(game, 'recruitment-panel-queue-wait', error);
     }
+}
+
+function scheduleComponentDisable(game) {
+    if (!game || game.componentsDisabled || !game.message) {
+        return Promise.resolve(game?.componentsDisabled === true);
+    }
+    if (game.componentDisablePromise) return game.componentDisablePromise;
+
+    let operation;
+    operation = (async () => {
+        await waitForRecruitmentPanelQueue(game);
+        if (game.componentsDisabled) return true;
+        const disabled = await editPublicPanel(game, {
+            components: [joinRow(game.id, true)],
+        }, 'disable-components');
+        if (disabled) game.componentsDisabled = true;
+        return disabled;
+    })()
+        .catch(error => {
+            logDiscordFailure(game, 'disable-components', error);
+            return false;
+        })
+        .finally(() => {
+            if (game.componentDisablePromise === operation) {
+                game.componentDisablePromise = null;
+            }
+        });
+    game.componentDisablePromise = operation;
+    return operation;
+}
+
+async function cleanupRouletteGame(game) {
+    await waitForRecruitmentPanelQueue(game);
+    if (!game.componentsDisabled) {
+        await scheduleComponentDisable(game);
+    }
+    await gameManager.cleanupGame(game);
 }
 
 async function fetchValidParticipants(game, participantIds) {
@@ -344,7 +384,7 @@ async function settleClaimedGame(game) {
         if (resultUpdated) game.componentsDisabled = true;
     }
 
-    await gameManager.cleanupGame(game);
+    await cleanupRouletteGame(game);
 }
 
 async function finishRecruitment(game) {
@@ -393,14 +433,8 @@ async function startRoulette(interaction) {
             await handleRouletteMemberInvalidated(game, invalidUserId, 'member-invalidated');
         }
     };
-    provisionalGame.disableComponents = async () => {
-        if (!game || game.componentsDisabled || !game.message) return;
-        await waitForRecruitmentPanelQueue(game);
-        if (game.componentsDisabled) return;
-        const disabled = await editPublicPanel(game, {
-            components: [joinRow(game.id, true)],
-        }, 'disable-components');
-        if (disabled) game.componentsDisabled = true;
+    provisionalGame.disableComponents = () => {
+        void scheduleComponentDisable(game);
     };
 
     const created = gameManager.createGame(provisionalGame);
@@ -424,7 +458,7 @@ async function startRoulette(interaction) {
         }
     } catch (error) {
         logDiscordFailure(game, 'recruitment-panel', error, userId);
-        await gameManager.cleanupGame(game);
+        await cleanupRouletteGame(game);
         return false;
     }
 
@@ -434,7 +468,7 @@ async function startRoulette(interaction) {
     } catch (error) {
         logDiscordFailure(game, 'fetch-recruitment-panel', error, userId);
         if (!game.message) {
-            await gameManager.cleanupGame(game);
+            await cleanupRouletteGame(game);
             return false;
         }
     }
@@ -529,21 +563,24 @@ async function handleRouletteInteraction(interaction, parts) {
         return false;
     }
 
-    const panelResult = await queueRecruitmentPanelEdit(game, 'join-count-panel');
-    const panelUpdated = panelResult.updated;
     let joined = false;
     let startWhenUnlocked = false;
-    await gameManager.runExclusive(game, () => {
-        game.pendingJoins = Math.max(0, game.pendingJoins - 1);
-        if (!panelUpdated) {
-            gameManager.removePlayer(game, userId);
-        } else {
-            joined = game.participantIds.includes(userId);
-        }
-        startWhenUnlocked = game.pendingJoins === 0
-            && game.state === 'recruiting'
-            && (game.startRequested || game.participantIds.length === MAX_PARTICIPANTS);
+    const panelResult = await queueRecruitmentPanelEdit(game, 'join-count-panel', async result => {
+        await gameManager.runExclusive(game, () => {
+            game.pendingJoins = Math.max(0, game.pendingJoins - 1);
+            if (!result.updated) {
+                gameManager.removePlayer(game, userId);
+            } else {
+                joined = !game.ended
+                    && game.state === 'recruiting'
+                    && game.participantIds.includes(userId);
+            }
+            startWhenUnlocked = game.pendingJoins === 0
+                && game.state === 'recruiting'
+                && (game.startRequested || game.participantIds.length === MAX_PARTICIPANTS);
+        });
     });
+    const panelUpdated = panelResult.updated;
 
     if (!panelUpdated) {
         await safeEphemeralReply(interaction, JOIN_FAILURE_MESSAGE, game);
