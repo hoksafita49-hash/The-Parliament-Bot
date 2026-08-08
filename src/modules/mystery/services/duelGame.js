@@ -10,6 +10,7 @@ const gameManager = require('./mysteryGameManager');
 
 const INVITATION_DURATION_MS = 60_000;
 const ROUND_DURATION_MS = 30_000;
+const MAX_DUEL_ROUNDS = 7;
 const DUEL_TIMEOUT_DURATION_MS = 3 * 60_000;
 const DUEL_TIMEOUT_REASON = '神秘指令：死斗';
 
@@ -27,6 +28,13 @@ const INVALID_CHOICE_MESSAGE = '⚠️ **这个出拳无效。**';
 const CHOICE_RECORDED_MESSAGE = '✅ **出拳已记录。**\n等待对手完成选择。';
 const BOTH_TIMEOUT_DESCRIPTION = '💤 **两个人都没出拳。**\n\n看来这场死斗的杀气也就到这里了。\n\n**本场死斗自动取消。**';
 const INVALIDATED_DESCRIPTION = '⚔️ **死斗中止。**\n\n由于其中一名玩家已无法继续参与，本场死斗自动取消。';
+const ROUND_LIMIT_DESCRIPTION = [
+    '⌛ **死斗已失效**',
+    '',
+    '双方鏖战 **7 轮**，仍然没有分出胜负。',
+    '',
+    '本场死斗到此为止，双方均不受处罚。',
+].join('\n');
 const SHIELD_LINE = '🛡️ **但禁言被神秘力量阻挡，未能生效。**';
 
 const CHOICES = {
@@ -199,6 +207,7 @@ function invitationDescription(initiatorId, requestedOpponentId) {
             '- 双人游戏',
             '- 石头剪刀布',
             '- 三局两胜',
+            '- 最多进行 **7 轮**；仍未分出胜负则自动失效',
             '- 输家将被 **禁言 3 分钟**',
             '',
             `<@${requestedOpponentId}>，敢接吗？`,
@@ -213,6 +222,7 @@ function invitationDescription(initiatorId, requestedOpponentId) {
         '- 双人游戏',
         '- 石头剪刀布',
         '- 三局两胜',
+        '- 最多进行 **7 轮**；仍未分出胜负则自动失效',
         '- 输家将被 **禁言 3 分钟**',
         '',
         '谁敢来？',
@@ -604,6 +614,28 @@ async function publishRoundResolution(game, snapshot) {
         if (game.finalEffect?.token === snapshot.effectToken) game.finalEffect.phase = 'complete';
         await cleanupDuelGame(game);
         return true;
+    }
+
+    if (snapshot.number >= MAX_DUEL_ROUNDS) {
+        let ownsRoundLimit = false;
+        await gameManager.runExclusive(game, () => {
+            if (
+                game.ended
+                || game.state !== 'round'
+                || game.round?.id !== snapshot.roundId
+            ) return;
+            game.state = 'ended';
+            ownsRoundLimit = true;
+        });
+        if (!ownsRoundLimit) return false;
+
+        const expiryMessage = await queuePublicWrite(game, () => safeSend(
+            game,
+            { embeds: [makeEmbed(ROUND_LIMIT_DESCRIPTION)] },
+            'round-limit-expired'
+        ));
+        await cleanupDuelGame(game);
+        return Boolean(expiryMessage);
     }
 
     let nextRound = null;
