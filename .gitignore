@@ -22,3 +22,6 @@ backupdata/
 .limcode/
 .claude/
 .worktrees/
+data/mystery/bombCooldowns.json
+data/mystery/bombCooldowns.corrupt-*.json
+data/mystery/bombCooldowns.*.tmp
