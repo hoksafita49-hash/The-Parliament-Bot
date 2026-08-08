@@ -5,14 +5,22 @@ function getMemberIds(member) {
     const memberId = member?.id;
     const userId = member?.user?.id;
 
-    if (!guildId || (!memberId && !userId)) {
-        return null;
-    }
-    if (memberId && userId && memberId !== userId) {
+    if (
+        typeof guildId !== 'string'
+        || guildId.trim().length === 0
+        || guildId !== guildId.trim()
+        || typeof memberId !== 'string'
+        || memberId.trim().length === 0
+        || memberId !== memberId.trim()
+        || typeof userId !== 'string'
+        || userId.trim().length === 0
+        || userId !== userId.trim()
+        || memberId !== userId
+    ) {
         return null;
     }
 
-    return { guildId, userId: userId || memberId };
+    return { guildId, userId };
 }
 
 function isFiniteTimestamp(value) {
