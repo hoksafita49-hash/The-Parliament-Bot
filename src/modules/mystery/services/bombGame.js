@@ -16,6 +16,7 @@ const BOMB_TIMEOUT_REASON = '神秘指令：传炸弹';
 const MIN_PARTICIPANTS = 3;
 const MAX_PARTICIPANTS = 8;
 const cooldownLoadPromises = new WeakMap();
+const PANEL_SKIPPED = Symbol('panel-skipped');
 
 const PLAYER_BUSY_MESSAGE = '🚫 **一心不能二用。**\n你现在已经在一场神秘游戏里，先把那边活着玩完再说。';
 const CHANNEL_BUSY_MESSAGE = '🎮 **这里已经有一场游戏在进行了。**\n等当前游戏结束后再开新的吧。';
@@ -113,16 +114,16 @@ function recruitmentClosedDescription(count) {
     ].join('\n');
 }
 
-function firstHolderDescription(game) {
+function firstHolderDescription(snapshot) {
     return [
-        `💣 **恭喜 <@${game.currentHolderId}> 成为第一位倒霉蛋。**`,
+        `💣 **恭喜 <@${snapshot.currentHolderId}> 成为第一位倒霉蛋。**`,
         '',
         '这东西现在归你了。',
         '',
         '**参与者**',
-        game.participantIds.map(userId => `<@${userId}>`).join(' · '),
+        snapshot.participantIds.map(userId => `<@${userId}>`).join(' · '),
         '',
-        `**当前持有者：<@${game.currentHolderId}>**`,
+        `**当前持有者：<@${snapshot.currentHolderId}>**`,
         '**已传递：0 次**',
     ].join('\n');
 }
@@ -213,10 +214,10 @@ function recruitmentPayload(game, disabled = false, description = recruitmentDes
     };
 }
 
-function bombPayload(game, description, disabled = false) {
+function bombPayload(gameId, messageToken, description, disabled = false) {
     return {
         embeds: [makeEmbed(description)],
-        components: [passRow(game.id, game.messageToken, disabled)],
+        components: [passRow(gameId, messageToken, disabled)],
     };
 }
 
@@ -252,16 +253,31 @@ async function ensureCooldownStoreLoaded(store, game, userId) {
 }
 
 async function safeEphemeralReply(interaction, content, game, components) {
-    const payload = { content, flags: MessageFlags.Ephemeral };
-    if (components) payload.components = components;
+    const response = { content };
+    if (components) response.components = components;
     try {
-        if (interaction.deferred || interaction.replied) {
-            await interaction.followUp?.(payload);
+        if (interaction.deferred && !interaction.replied && typeof interaction.editReply === 'function') {
+            await interaction.editReply(response);
+        } else if (interaction.replied) {
+            await interaction.followUp?.({ ...response, flags: MessageFlags.Ephemeral });
         } else {
-            await interaction.reply?.(payload);
+            await interaction.reply?.({ ...response, flags: MessageFlags.Ephemeral });
         }
     } catch (error) {
         logDiscordFailure(game, 'ephemeral-reply', error, interaction.user?.id);
+    }
+}
+
+async function deferEphemeralComponent(interaction, game) {
+    if (interaction.deferred || interaction.replied || typeof interaction.deferReply !== 'function') {
+        return true;
+    }
+    try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        return true;
+    } catch (error) {
+        logDiscordFailure(game, 'defer-component-reply', error, interaction.user?.id);
+        return false;
     }
 }
 
@@ -407,6 +423,28 @@ async function explodeBomb(game, currentTime = nowFor(game)) {
     return false;
 }
 
+function installExplosionTimer(game) {
+    if (game.ended || game.state !== 'active' || game.explosionTimer) return false;
+    const delay = Math.max(0, game.explodeAt - nowFor(game));
+    game.explosionTimer = setTimeout(() => {
+        void explodeBomb(game, nowFor(game))
+            .catch(error => logDiscordFailure(game, 'explosion-timer', error));
+    }, delay);
+    game.timers.add(game.explosionTimer);
+    return true;
+}
+
+async function abortAfterCriticalPanelFailure(game) {
+    let claimed = false;
+    await gameManager.runExclusive(game, () => {
+        if (game.ended || game.state === 'ended' || game.state === 'exploding') return;
+        game.state = 'cancelling';
+        claimed = true;
+    });
+    if (claimed) await cleanupBombGame(game);
+    return claimed;
+}
+
 async function cancelForTooFew(game, recruitment = false) {
     const description = recruitment ? cancellationDescription() : cancellationAfterInvalidationDescription();
     if (recruitment) {
@@ -447,6 +485,7 @@ async function finishRecruitment(game) {
 
     const validIds = await fetchValidParticipants(game, snapshot);
     let outcome = null;
+    let activationSnapshot = null;
     await gameManager.runExclusive(game, () => {
         if (game.ended || game.state !== 'recruiting') return;
         for (const userId of [...game.participantIds]) {
@@ -466,6 +505,12 @@ async function finishRecruitment(game) {
         game.holderSince = currentTime;
         game.passCount = 0;
         game.messageToken = 1;
+        installExplosionTimer(game);
+        activationSnapshot = {
+            participantIds: [...game.participantIds],
+            currentHolderId: game.currentHolderId,
+            messageToken: game.messageToken,
+        };
         outcome = 'active';
     });
 
@@ -475,33 +520,45 @@ async function finishRecruitment(game) {
     }
     if (outcome !== 'active') return false;
 
-    await queuePanelWrite(game, () => safeEdit(
-        game.recruitmentMessage,
-        recruitmentPayload(game, true, recruitmentClosedDescription(game.participantIds.length)),
-        game,
-        'close-recruitment'
-    ));
-    await queuePublicWrite(game, async () => {
-        const message = await safeSend(
-            game,
-            bombPayload(game, firstHolderDescription(game)),
-            'first-holder-message'
-        );
+    const firstPayload = bombPayload(
+        game.id,
+        activationSnapshot.messageToken,
+        firstHolderDescription(activationSnapshot)
+    );
+    const firstMessagePromise = queuePublicWrite(game, async () => {
+        if (
+            game.ended
+            || game.state !== 'active'
+            || game.messageToken !== activationSnapshot.messageToken
+            || game.currentHolderId !== activationSnapshot.currentHolderId
+        ) return PANEL_SKIPPED;
+        const message = await safeSend(game, firstPayload, 'first-holder-message');
         if (message) {
-            message.bombMessageToken = game.messageToken;
+            message.bombMessageToken = activationSnapshot.messageToken;
             game.currentMessage = message;
             game.bombMessages.add(message);
-            game.messageByToken.set(game.messageToken, message);
+            game.messageByToken.set(activationSnapshot.messageToken, message);
         }
         return message;
     });
-
-    const delay = Math.max(0, game.explodeAt - nowFor(game));
-    game.explosionTimer = setTimeout(() => {
-        void explodeBomb(game, nowFor(game)).catch(error => logDiscordFailure(game, 'explosion-timer', error));
-    }, delay);
-    game.timers.add(game.explosionTimer);
-    return true;
+    const closePanelPromise = queuePanelWrite(game, () => safeEdit(
+        game.recruitmentMessage,
+        recruitmentPayload(
+            game,
+            true,
+            recruitmentClosedDescription(activationSnapshot.participantIds.length)
+        ),
+        game,
+        'close-recruitment'
+    ));
+    const firstMessage = await firstMessagePromise;
+    if (firstMessage === null) {
+        await abortAfterCriticalPanelFailure(game);
+        await closePanelPromise;
+        return false;
+    }
+    await closePanelPromise;
+    return firstMessage !== PANEL_SKIPPED;
 }
 
 async function startBomb(interaction) {
@@ -588,6 +645,11 @@ async function startBomb(interaction) {
         return false;
     }
     try {
+        await cooldownStore.startCooldown(guildId, userId);
+    } catch (error) {
+        logDiscordFailure(game, 'cooldown-start', error, userId);
+    }
+    try {
         const fetched = await interaction.fetchReply?.();
         if (typeof fetched?.edit === 'function') game.recruitmentMessage = fetched;
     } catch (error) {
@@ -598,11 +660,6 @@ async function startBomb(interaction) {
         }
     }
 
-    try {
-        await cooldownStore.startCooldown(guildId, userId);
-    } catch (error) {
-        logDiscordFailure(game, 'cooldown-start', error, userId);
-    }
     game.recruitmentTimer = setTimeout(() => {
         void finishRecruitment(game).catch(error => logDiscordFailure(game, 'recruitment-timer', error));
     }, RECRUITMENT_DURATION_MS);
@@ -810,7 +867,13 @@ async function submitBombTarget(game, input) {
     }
     if (!passCommit) return result;
 
-    await queuePublicWrite(game, async () => {
+    const deliveredMessage = await queuePublicWrite(game, async () => {
+        if (
+            game.ended
+            || game.state !== 'active'
+            || game.messageToken !== passCommit.newToken
+            || game.currentHolderId !== passCommit.toId
+        ) return PANEL_SKIPPED;
         const oldMessage = game.messageByToken?.get(passCommit.oldToken) || passCommit.oldMessage;
         await disableBombMessage(game, oldMessage, passCommit.oldToken);
         const payload = {
@@ -833,6 +896,10 @@ async function submitBombTarget(game, input) {
         }
         return message;
     });
+    if (deliveredMessage === null) {
+        await abortAfterCriticalPanelFailure(game);
+        return { ok: false, reason: 'delivery' };
+    }
     return result;
 }
 
@@ -858,6 +925,7 @@ async function handleTargetSelect(interaction, game, messageToken) {
 async function handleBombInteraction(interaction, parts) {
     const parsed = parseParts(parts);
     const game = parsed.gameId && gameManager.getGame(parsed.gameId);
+    if (!await deferEphemeralComponent(interaction, game)) return false;
     if (!game || game.type !== 'bomb') {
         await safeEphemeralReply(interaction, EXPIRED_MESSAGE, game);
         return false;
@@ -945,7 +1013,13 @@ async function handleBombMemberInvalidated(game, userId, reason) {
     } else if (outcome === 'cancel') {
         await cancelForTooFew(game, false);
     } else if (outcome === 'reassign') {
-        await queuePublicWrite(game, async () => {
+        const deliveredMessage = await queuePublicWrite(game, async () => {
+            if (
+                game.ended
+                || game.state !== 'active'
+                || game.messageToken !== reassignment.newToken
+                || game.currentHolderId !== reassignment.newHolderId
+            ) return PANEL_SKIPPED;
             const oldMessage = game.messageByToken?.get(reassignment.oldToken) || reassignment.oldMessage;
             await disableBombMessage(game, oldMessage, reassignment.oldToken);
             const payload = {
@@ -963,6 +1037,9 @@ async function handleBombMemberInvalidated(game, userId, reason) {
             }
             return message;
         });
+        if (deliveredMessage === null) {
+            await abortAfterCriticalPanelFailure(game);
+        }
     }
     return true;
 }
