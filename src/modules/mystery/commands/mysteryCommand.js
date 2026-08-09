@@ -14,6 +14,7 @@ const gameManager = require('../services/mysteryGameManager');
 const { startRoulette } = require('../services/rouletteGame');
 const { startBomb } = require('../services/bombGame');
 const { startDuel } = require('../services/duelGame');
+const { getNames } = require('../services/namePoolStore');
 
 const SUBCOMMAND_SELF_TIMEOUT = '自刎归天';
 const SUBCOMMAND_RANDOM_NICKNAME = '取名字好麻烦';
@@ -41,14 +42,6 @@ const NICKNAME_FAILURE_MESSAGE = '❌ 名字取好了，但我改不了你的昵
 const GENERIC_FAILURE_MESSAGE = '❌ 处理神秘指令时出现错误，请稍后重试。';
 const PLAYER_BUSY_MESSAGE = '🚫 **一心不能二用。**\n你现在已经在一场神秘游戏里，先把那边活着玩完再说。';
 const initiationQueues = new Map();
-
-const NAME_POOL = [
-    '我是奶人', '奶奶的龙', '铁血旅程派', '铁血类脑派', '权蛆', 'D喵梦男', 'D喵梦女',
-    '大狗叫！', '猪猪之王', '类脑自研文爱AI', '赛博街溜子', '名字被狗吃了',
-    '管理组重点观察对象', '用户名涉嫌违规', '类脑最纯洁之人', '类脑最淫乱之人', '基米',
-    '我不是gay', '我是好女孩吗', '类脑第一深情', '名字已被夺舍', '疑似真人',
-    '别问我为什么叫这个', '嘉豪本豪', '我现在后悔还来得及吗', '嘉豪',
-];
 
 const data = new SlashCommandBuilder()
     .setName('神秘指令')
@@ -132,17 +125,18 @@ async function executeSelfTimeout(interaction) {
     };
 }
 
-function selectRandomNickname(currentDisplayName) {
-    let selectedName = NAME_POOL[Math.floor(Math.random() * NAME_POOL.length)];
-    if (selectedName === currentDisplayName) {
-        selectedName = NAME_POOL[Math.floor(Math.random() * NAME_POOL.length)];
-    }
-    return selectedName;
+function selectRandomNickname(names, currentDisplayName) {
+    const candidates = names.length > 1
+        ? names.filter(name => name !== currentDisplayName)
+        : names;
+    const effectiveCandidates = candidates.length > 0 ? candidates : names;
+    return effectiveCandidates[Math.floor(Math.random() * effectiveCandidates.length)];
 }
 
 async function executeRandomNickname(interaction) {
     const member = interaction.member;
-    const selectedName = selectRandomNickname(member.displayName);
+    const names = await getNames();
+    const selectedName = selectRandomNickname(names, member.displayName);
     try {
         await member.setNickname(selectedName);
     } catch (error) {
@@ -256,7 +250,7 @@ async function execute(interaction) {
         }
         const preflightFailure = getPreflightFailure(interaction, subcommand);
         if (preflightFailure) {
-            await interaction.reply({ content: preflightFailure, flags: MessageFlags.Ephemeral });
+            await interaction.reply({ content: preflightFailure });
             return;
         }
         await interaction.deferReply();
@@ -267,7 +261,7 @@ async function execute(interaction) {
             const failureMessage = subcommand === SUBCOMMAND_SELF_TIMEOUT
                 ? TIMEOUT_FAILURE_MESSAGE
                 : NICKNAME_FAILURE_MESSAGE;
-            await replacePublicDeferWithPrivateFailure(interaction, failureMessage);
+            await interaction.editReply({ content: failureMessage });
             return;
         }
         startCooldown(guildId, userId, subcommand);
