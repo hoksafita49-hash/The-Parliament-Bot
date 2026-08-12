@@ -30,7 +30,6 @@ const { startCourtChecker } = require('../modules/court/services/courtChecker');
 const { startSelfModerationChecker } = require('../modules/selfModeration/services/moderationChecker');
 const { startAttachmentCleanupScheduler } = require('../modules/selfModeration/services/archiveService');
 const { startVoteChecker } = require('../modules/voting/services/voteChecker');
-const { startElectionScheduler } = require('../modules/election/services/electionScheduler');
 const { printTimeConfig } = require('./config/timeconfig');
 const { startActivityTracker } = require('../modules/selfRole/services/activityTracker');
 const { syncMissedActivity } = require('../modules/selfRole/services/autoSyncService');
@@ -61,13 +60,8 @@ const setSupportPermissionsCommand = require('../modules/proposal/commands/setSu
 const reviewProposalCommand = require('../modules/proposal/commands/reviewProposal');
 const setProposalReviewersCommand = require('../modules/proposal/commands/setProposalReviewers');
 
-// 审核系统命令
-const setupReviewCommand = require('../modules/creatorReview/commands/setupReview');
-const deleteReviewEntryCommand = require('../modules/creatorReview/commands/deleteReviewEntry');
-const addAllowPreviewServerCommand = require('../modules/creatorReview/commands/addAllowPreviewServer');
-const removeAllowPreviewServerCommand = require('../modules/creatorReview/commands/removeAllowPreviewServer');
-const addAllowedForumCommand = require('../modules/creatorReview/commands/addAllowedForum'); 
-const removeAllowedForumCommand = require('../modules/creatorReview/commands/removeAllowedForum');
+// 审核系统命令（已合并为 /创作者审核）
+const creatorReviewCommand = require('../modules/creatorReview/commands/creatorReview');
 
 // 法庭系统命令
 const setAllowCourtRoleCommand = require('../modules/court/commands/setAllowCourtRole');
@@ -77,16 +71,10 @@ const applyToCourtCommand = require('../modules/court/commands/applyToCourt');
 const deleteShitMessageCommand = require('../modules/selfModeration/commands/deleteShitMessage');
 const muteShitUserCommand = require('../modules/selfModeration/commands/muteShitUser');
 const seriousMuteCommand = require('../modules/selfModeration/commands/seriousMute');
-const setSelfModerationRolesCommand = require('../modules/selfModeration/commands/setSelfModerationRoles');
-const setSelfModerationChannelsCommand = require('../modules/selfModeration/commands/setSelfModerationChannels');
-const setSelfModerationCooldownCommand = require('../modules/selfModeration/commands/setSelfModerationCooldown');
-const setMessageTimeLimitCommand = require('../modules/selfModeration/commands/setMessageTimeLimit');
+// 8 个配置指令已合并为 /搬石公投配置
+const selfModerationConfigCommand = require('../modules/selfModeration/commands/selfModerationConfig');
 const checkMyCooldownCommand = require('../modules/selfModeration/commands/checkMyCooldown');
-const setArchiveChannelCommand = require('../modules/selfModeration/commands/setArchiveChannel');
-const setArchiveViewRoleCommand = require('../modules/selfModeration/commands/setArchiveViewRole');
 const getArchiveViewPermissionCommand = require('../modules/selfModeration/commands/getArchiveViewPermission');
-const manageAttachmentCleanupCommand = require('../modules/selfModeration/commands/manageAttachmentCleanup');
-const manageSelfModerationBlacklistCommand = require('../modules/selfModeration/commands/manageSelfModerationBlacklist');
 
 // 赛事系统命令
 const setupContestApplicationCommand = require('../modules/contest/commands/setupContestApplication');
@@ -106,6 +94,10 @@ const setExternalSubmissionOptInCommand = require('../modules/contest/commands/s
 const viewSubmissionsCommand = require('../modules/contest/commands/viewSubmissions');
 const viewSubmissionsContextCommand = require('../modules/contest/commands/viewSubmissionsContext');
 const manageApplicationNotifyCommand = require('../modules/contest/commands/manageApplicationNotify');
+const syncTournamentCommand = require('../modules/contest/commands/syncTournament');
+const deleteTournamentCommand = require('../modules/contest/commands/deleteTournament');
+const listBooklistsCommand = require('../modules/contest/commands/listBooklists');
+const manageSyncExclusionCommand = require('../modules/contest/commands/manageSyncExclusion');
 
 // 自动清理系统命令（合并后）
 const keywordManagerCommand = require('../modules/autoCleanup/commands/keywordManager');
@@ -121,44 +113,13 @@ const createVoteCommand = require('../modules/voting/commands/createVote');
 // 添加新的通知身份组命令
 const notificationRolesCommand = require('../modules/voting/commands/notificationRoles');
 
-// 选举系统命令 - 完整的命令列表
-const setElectionPositionsCommand = require('../modules/election/commands/setElectionPositions');
-const setElectionTimeScheduleCommand = require('../modules/election/commands/setElectionTimeSchedule');
-const setupElectionEntryCommand = require('../modules/election/commands/setupElectionEntry');
-const getElectionStatusCommand = require('../modules/election/commands/getElectionStatus');
-const setRegistrationRolesCommand = require('../modules/election/commands/setRegistrationRoles');
-const setVotingRolesCommand = require('../modules/election/commands/setVotingRoles');
-const setNotificationRolesCommand = require('../modules/election/commands/setNotificationRoles');
-const getTieAnalysisCommand = require('../modules/election/commands/getTieAnalysis');
-const reprocessElectionResultsCommand = require('../modules/election/commands/reprocessElectionResults');
-const viewCandidateInfoCommand = require('../modules/election/commands/viewCandidateInfo');
-const manageCandidateStatusCommand = require('../modules/election/commands/manageCandidateStatus');
-const scanCandidateMessagesCommand = require('../modules/election/commands/scanCandidateMessages');
-const editCandidateInfoCommand = require('../modules/election/commands/editCandidateInfo');
-const clearElectionVoteCommand = require('../modules/election/commands/clearElectionVote');
-const viewVoteRemovalLogsCommand = require('../modules/election/commands/viewVoteRemovalLogs');
-const updateVotingCandidatesCommand = require('../modules/election/commands/updateVotingCandidates');
-
 const { messageCreateHandler } = require('./events/messageCreate');
-
-// 论坛重建系统命令
-const rebuildForumCommand = require('../modules/forumRebuilder/commands/rebuildForum');
-
-// 帖子重建系统命令
-const rebuildThreadsCommand = require('../modules/threadRebuilder/commands/rebuildThreads');
-const deleteRebuiltMessageCommand = require('../modules/threadRebuilder/commands/deleteRebuiltMessage');
 
 // 自助文件上传系统命令
 const uploadCommand = require('../modules/selfFileUpload/commands/uploadFile');
 const whoisCommand = require('../modules/selfFileUpload/commands/queryAnonymousLog');
 const manageOptOutCommand = require('../modules/selfFileUpload/commands/manageOptOut.js');
 const collectBackupsCommand = require('../modules/selfFileUpload/commands/collectBackups.js');
-
-// 补卡系统命令
-// const processBackupCardsCommand = require('../modules/backupCards/commands/processBackupCards');
-// const testBackupCardsCommand = require('../modules/backupCards/commands/testBackupCards');
-// const archiveBackupThreadsCommand = require('../modules/backupCards/commands/archiveBackupThreads');
-// const cleanupFuzzyMatchesCommand = require('../modules/backupCards/commands/cleanupFuzzyMatches');
 
 //// 自助身份组系统命令
 const setupRolePanelCommand = require('../modules/selfRole/commands/setupRolePanel');
@@ -184,6 +145,13 @@ const roleSyncConfigCommand = require('../modules/roleSync/commands/roleSyncConf
 // 处罚系统
 const { startPunishmentSystem } = require('../modules/punishment');
 const punishCommand = require('../modules/punishment/commands/punish');
+const disciplineCommand = require('../modules/punishment/commands/discipline');
+const disciplineConfigCommand = require('../modules/punishment/commands/disciplineConfig');
+
+// 机器人消息管理系统（编辑 bot 已发出的常驻消息）
+const { startBotMessageSystem } = require('../modules/botMessage');
+const botMessageCommand = require('../modules/botMessage/commands/botMessage');
+const editBotMessageContextCommand = require('../modules/botMessage/commands/editBotMessageContext');
 
 // 分服受控邀请系统
 const { startControlledInviteSystem, controlledInviteGuildMemberAddHandler } = require('../modules/controlledInvite');
@@ -191,6 +159,18 @@ const controlledInviteConfigCommand = require('../modules/controlledInvite/comma
 const controlledInviteParamsCommand = require('../modules/controlledInvite/commands/controlledInviteParams');
 const controlledInviteToggleCommand = require('../modules/controlledInvite/commands/controlledInviteToggle');
 const viewMyControlledInviteStatusCommand = require('../modules/controlledInvite/commands/viewMyControlledInviteStatus');
+
+// Discord 安全措施（邀请暂停托管）
+const { startSafetySetupSystem } = require('../modules/safetySetup');
+
+// 神秘指令娱乐系统
+const mysteryCommand = require('../modules/mystery/commands/mysteryCommand');
+const manageCommand = require('../modules/mystery/commands/manageCommand');
+const mysteryGameStatsCommand = require('../modules/mystery/commands/gameStatsCommand');
+const mysterySettingsCommand = require('../modules/mystery/commands/mysterySettingsCommand');
+const { mysteryGuildMemberRemoveHandler } = require('../modules/mystery/events/guildMemberRemove');
+const { mysteryGuildMemberUpdateHandler } = require('../modules/mystery/events/guildMemberUpdate');
+const mysteryNicknameLock = require('../modules/mystery/services/mysteryNicknameLock');
 
 const DISCORD_REST_TIMEOUT_MS = (() => {
     const n = Number(process.env.DISCORD_REST_TIMEOUT_MS);
@@ -265,13 +245,8 @@ client.commands.set(setSupportPermissionsCommand.data.name, setSupportPermission
 client.commands.set(reviewProposalCommand.data.name, reviewProposalCommand);
 client.commands.set(setProposalReviewersCommand.data.name, setProposalReviewersCommand);
 
-// 审核系统命令
-client.commands.set(setupReviewCommand.data.name, setupReviewCommand);
-client.commands.set(deleteReviewEntryCommand.data.name, deleteReviewEntryCommand);
-client.commands.set(addAllowPreviewServerCommand.data.name, addAllowPreviewServerCommand);
-client.commands.set(removeAllowPreviewServerCommand.data.name, removeAllowPreviewServerCommand);
-client.commands.set(addAllowedForumCommand.data.name, addAllowedForumCommand);
-client.commands.set(removeAllowedForumCommand.data.name, removeAllowedForumCommand);
+// 审核系统命令（已合并为 /创作者审核）
+client.commands.set(creatorReviewCommand.data.name, creatorReviewCommand);
 
 // 法庭系统命令
 client.commands.set(setAllowCourtRoleCommand.data.name, setAllowCourtRoleCommand);
@@ -281,16 +256,9 @@ client.commands.set(applyToCourtCommand.data.name, applyToCourtCommand);
 client.commands.set(deleteShitMessageCommand.data.name, deleteShitMessageCommand);
 client.commands.set(muteShitUserCommand.data.name, muteShitUserCommand);
 client.commands.set(seriousMuteCommand.data.name, seriousMuteCommand);
-client.commands.set(setSelfModerationRolesCommand.data.name, setSelfModerationRolesCommand);
-client.commands.set(setSelfModerationChannelsCommand.data.name, setSelfModerationChannelsCommand);
-client.commands.set(setSelfModerationCooldownCommand.data.name, setSelfModerationCooldownCommand);
-client.commands.set(setMessageTimeLimitCommand.data.name, setMessageTimeLimitCommand);
+client.commands.set(selfModerationConfigCommand.data.name, selfModerationConfigCommand);
 client.commands.set(checkMyCooldownCommand.data.name, checkMyCooldownCommand);
-client.commands.set(setArchiveChannelCommand.data.name, setArchiveChannelCommand);
-client.commands.set(setArchiveViewRoleCommand.data.name, setArchiveViewRoleCommand);
 client.commands.set(getArchiveViewPermissionCommand.data.name, getArchiveViewPermissionCommand);
-client.commands.set(manageAttachmentCleanupCommand.data.name, manageAttachmentCleanupCommand);
-client.commands.set(manageSelfModerationBlacklistCommand.data.name, manageSelfModerationBlacklistCommand);
 
 // 赛事系统命令
 client.commands.set(setupContestApplicationCommand.data.name, setupContestApplicationCommand);
@@ -310,24 +278,15 @@ client.commands.set(setExternalSubmissionOptInCommand.data.name, setExternalSubm
 client.commands.set(viewSubmissionsCommand.data.name, viewSubmissionsCommand);
 client.commands.set(viewSubmissionsContextCommand.data.name, viewSubmissionsContextCommand);
 client.commands.set(manageApplicationNotifyCommand.data.name, manageApplicationNotifyCommand);
+client.commands.set(syncTournamentCommand.data.name, syncTournamentCommand);
+client.commands.set(deleteTournamentCommand.data.name, deleteTournamentCommand);
+client.commands.set(listBooklistsCommand.data.name, listBooklistsCommand);
+client.commands.set(manageSyncExclusionCommand.data.name, manageSyncExclusionCommand);
 
 // 自动清理系统命令（合并后）
 client.commands.set(keywordManagerCommand.data.name, keywordManagerCommand);
 client.commands.set(exemptManagerCommand.data.name, exemptManagerCommand);
 client.commands.set(cleanupManagerCommand.data.name, cleanupManagerCommand);
-
-// 论坛重建系统命令
-client.commands.set(rebuildForumCommand.data.name, rebuildForumCommand);
-
-// 帖子重建系统命令
-client.commands.set(rebuildThreadsCommand.data.name, rebuildThreadsCommand);
-client.commands.set(deleteRebuiltMessageCommand.data.name, deleteRebuiltMessageCommand);
-
-// 补卡系统命令
-// client.commands.set(processBackupCardsCommand.data.name, processBackupCardsCommand);
-// client.commands.set(testBackupCardsCommand.data.name, testBackupCardsCommand);
-// client.commands.set(archiveBackupThreadsCommand.data.name, archiveBackupThreadsCommand);
-// client.commands.set(cleanupFuzzyMatchesCommand.data.name, cleanupFuzzyMatchesCommand);
 
 // 频道总结系统命令
 client.commands.set(summarizeChannelCommand.data.name, summarizeChannelCommand);
@@ -337,24 +296,6 @@ client.commands.set(summaryPresetCommand.data.name, summaryPresetCommand);
 client.commands.set(createVoteCommand.data.name, createVoteCommand);
 // 注册新的通知身份组命令
 client.commands.set(notificationRolesCommand.data.name, notificationRolesCommand);
-
-// 选举系统命令 - 完整注册
-client.commands.set(setElectionPositionsCommand.data.name, setElectionPositionsCommand);
-client.commands.set(setElectionTimeScheduleCommand.data.name, setElectionTimeScheduleCommand);
-client.commands.set(setupElectionEntryCommand.data.name, setupElectionEntryCommand);
-client.commands.set(getElectionStatusCommand.data.name, getElectionStatusCommand);
-client.commands.set(setRegistrationRolesCommand.data.name, setRegistrationRolesCommand);
-client.commands.set(setVotingRolesCommand.data.name, setVotingRolesCommand);
-client.commands.set(setNotificationRolesCommand.data.name, setNotificationRolesCommand);
-client.commands.set(getTieAnalysisCommand.data.name, getTieAnalysisCommand);
-client.commands.set(reprocessElectionResultsCommand.data.name, reprocessElectionResultsCommand);
-client.commands.set(viewCandidateInfoCommand.data.name, viewCandidateInfoCommand);
-client.commands.set(manageCandidateStatusCommand.data.name, manageCandidateStatusCommand);
-client.commands.set(scanCandidateMessagesCommand.data.name, scanCandidateMessagesCommand);
-client.commands.set(editCandidateInfoCommand.data.name, editCandidateInfoCommand);
-client.commands.set(clearElectionVoteCommand.data.name, clearElectionVoteCommand);
-client.commands.set(viewVoteRemovalLogsCommand.data.name, viewVoteRemovalLogsCommand);
-client.commands.set(updateVotingCandidatesCommand.data.name, updateVotingCandidatesCommand);
 
 // 自助文件上传系统命令
 client.commands.set(uploadCommand.data.name, uploadCommand);
@@ -380,12 +321,34 @@ client.commands.set(roleSyncConfigCommand.data.name, roleSyncConfigCommand);
 
 // 处罚系统命令
 client.commands.set(punishCommand.data.name, punishCommand);
+client.commands.set(disciplineCommand.data.name, disciplineCommand);
+client.commands.set(disciplineConfigCommand.data.name, disciplineConfigCommand);
+
+// 机器人消息管理系统命令
+client.commands.set(botMessageCommand.data.name, botMessageCommand);
+client.commands.set(editBotMessageContextCommand.data.name, editBotMessageContextCommand);
 
 // 分服受控邀请系统命令
 client.commands.set(controlledInviteConfigCommand.data.name, controlledInviteConfigCommand);
 client.commands.set(controlledInviteParamsCommand.data.name, controlledInviteParamsCommand);
 client.commands.set(controlledInviteToggleCommand.data.name, controlledInviteToggleCommand);
 client.commands.set(viewMyControlledInviteStatusCommand.data.name, viewMyControlledInviteStatusCommand);
+
+// Discord 安全措施与神秘管理工具（统一为唯一 /管理）
+client.commands.set(manageCommand.data.name, manageCommand);
+
+// 神秘指令娱乐系统
+client.commands.set(mysteryCommand.data.name, mysteryCommand);
+client.commands.set(mysteryGameStatsCommand.data.name, mysteryGameStatsCommand);
+client.commands.set(mysterySettingsCommand.data.name, mysterySettingsCommand);
+
+// 加压轮盘测试指令：仅在 .env 里设置 MYSTERY_TEST_COMMANDS=true 时才注册，
+// 避免测试用的虚拟机器人局出现在正式服务器的指令列表里。
+if (String(process.env.MYSTERY_TEST_COMMANDS).toLowerCase() === 'true') {
+    const pressureTestCommand = require('../modules/mystery/commands/pressureTestCommand');
+    client.commands.set(pressureTestCommand.data.name, pressureTestCommand);
+    console.log('🧪 加压轮盘测试指令已注册（MYSTERY_TEST_COMMANDS=true）');
+}
 
 client.once(Events.ClientReady, async (readyClient) => {
     try {
@@ -417,13 +380,14 @@ client.once(Events.ClientReady, async (readyClient) => {
     startVoteChecker(readyClient);
     console.log('✅ 投票检查器已启动');
     
-    startElectionScheduler(readyClient);
-    console.log('✅ 选举调度器已启动');
-    
     // 初始化自动清理系统
     console.log('✅ 自动清理系统已启动');
 
     startActivityTracker();
+
+    // 统一恢复未结束的 Mystery 昵称锁（coward + duel），避免重启后昵称永久卡住
+    await mysteryNicknameLock.initialize(readyClient);
+    console.log('✅ Mystery 昵称锁恢复完成');
 
     // SelfRole 申请过期检查器（预留名额释放/旧数据兼容迁移）
     startSelfRoleApplicationChecker(readyClient);
@@ -443,14 +407,19 @@ client.once(Events.ClientReady, async (readyClient) => {
     // 启动处罚系统
     await startPunishmentSystem(readyClient);
 
+    // 启动机器人消息管理系统
+    await startBotMessageSystem(readyClient);
+
     // 启动分服受控邀请系统
     await startControlledInviteSystem(readyClient);
+
+    // 启动 Discord 安全措施邀请暂停托管
+    await startSafetySetupSystem(readyClient);
 
     console.log('\n🤖 机器人已完全启动，所有系统正常运行！');
     console.log('🏆 赛事管理系统已加载');
     console.log('🧹 自动消息清理系统已加载');
-    console.log('🗳️ 选举系统已完全加载 (包含16个命令)');
-    console.log('🎴 补卡管理系统已加载 (包含3个命令)');
+    console.log('📝 机器人消息管理系统已加载');
 })
 
 client.on(Events.InteractionCreate, interactionCreateHandler)
@@ -462,6 +431,8 @@ client.on(Events.GuildMemberAdd, controlledInviteGuildMemberAddHandler);
 client.on(Events.GuildMemberRemove, roleSyncGuildMemberRemoveHandler);
 client.on(Events.GuildMemberUpdate, roleSyncGuildMemberUpdateHandler);
 client.on(Events.GuildRoleDelete, roleSyncGuildRoleDeleteHandler);
+client.on(Events.GuildMemberRemove, mysteryGuildMemberRemoveHandler);
+client.on(Events.GuildMemberUpdate, mysteryGuildMemberUpdateHandler);
 
 function normalizeDiscordToken(raw) {
     if (!raw) return '';

@@ -323,6 +323,8 @@ function initializeSelfRoleDatabase() {
         );
         CREATE INDEX IF NOT EXISTS idx_sr_grants_guild_role_status
             ON sr_grants (guild_id, primary_role_id, status);
+        CREATE INDEX IF NOT EXISTS idx_sr_grants_guild_user_status
+            ON sr_grants (guild_id, user_id, status);
         CREATE INDEX IF NOT EXISTS idx_sr_grants_next_inquiry_at
             ON sr_grants (next_inquiry_at);
         CREATE INDEX IF NOT EXISTS idx_sr_grants_force_remove_at
@@ -807,6 +809,8 @@ async function saveUserActivityAndDailyBatchByDate(batchData, dailyBatchDataByDa
 
 /**
  * 获取用户在指定频道的每日活跃度数据。
+ * 注意：日期字段 date 为 UTC 日期（YYYY-MM-DD），UTC 0:00 = 北京时间 8:00，
+ * 因此每日统计以北京时间的上午 8:00 为分割点。
  * @param {string} guildId - 服务器ID。
  * @param {string} channelId - 频道ID。
  * @param {string} userId - 用户ID。
@@ -831,28 +835,60 @@ async function getUserDailyActivity(guildId, channelId, userId, days = 30) {
 }
 
 /**
+ * 汇总用户在指定频道中已有每日明细覆盖的活跃度数据。
+ */
+async function getUserDailyActivitySummary(guildId, channelId, userId) {
+    const stmt = selfRoleDb.prepare(`
+        SELECT
+            COUNT(*) AS day_rows,
+            COALESCE(SUM(message_count), 0) AS message_count,
+            MIN(date) AS first_date,
+            MAX(date) AS last_date
+        FROM daily_user_activity
+        WHERE guild_id = ? AND channel_id = ? AND user_id = ?
+    `);
+    const row = stmt.get(guildId, channelId, userId) || {};
+    return {
+        dayRows: Number(row.day_rows || 0),
+        messageCount: Number(row.message_count || 0),
+        firstDate: row.first_date || null,
+        lastDate: row.last_date || null,
+    };
+}
+
+/**
  * 计算用户在指定频道中满足每日发言阈值的天数。
  * @param {string} guildId - 服务器ID。
  * @param {string} channelId - 频道ID。
  * @param {string} userId - 用户ID。
  * @param {number} dailyThreshold - 每日发言数阈值。
- * @param {number} days - 查询最近多少天的数据（可选，默认90天）。
+ * @param {number|null} days - 查询最近多少天的数据；不传则不限制时间范围。
  * @returns {Promise<number>} 满足阈值的天数。
  */
-async function getUserActiveDaysCount(guildId, channelId, userId, dailyThreshold, days = 90) {
-    // 使用 UTC 时间计算起始日期，确保与数据存储时的日期计算一致
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - days);
-    const startDateStr = startDate.toISOString().split('T')[0]; // YYYY-MM-DD 格式（UTC）
+async function getUserActiveDaysCount(guildId, channelId, userId, dailyThreshold, days = null) {
+    const safeDays = Number(days);
+    const hasWindow = Number.isFinite(safeDays) && safeDays > 0;
 
+    const dateFilter = hasWindow ? 'AND date >= ?' : '';
     const stmt = selfRoleDb.prepare(`
         SELECT COUNT(*) as active_days
         FROM daily_user_activity
         WHERE guild_id = ? AND channel_id = ? AND user_id = ?
         AND message_count >= ?
-        AND date >= ?
+        ${dateFilter}
     `);
-    const row = stmt.get(guildId, channelId, userId, dailyThreshold, startDateStr);
+
+    let row;
+    if (hasWindow) {
+        // 使用 UTC 时间计算起始日期。UTC 0:00 = 北京时间 8:00，即每日统计以北京时间的上午 8:00 为分割点。
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - Math.floor(safeDays));
+        const startDateStr = startDate.toISOString().split('T')[0]; // YYYY-MM-DD 格式（UTC）
+        row = stmt.get(guildId, channelId, userId, dailyThreshold, startDateStr);
+    } else {
+        row = stmt.get(guildId, channelId, userId, dailyThreshold);
+    }
+
     return row ? row.active_days : 0;
 }
 
@@ -1750,6 +1786,43 @@ async function listSelfRoleGrantRoles(grantId) {
     `);
     const rows = stmt.all(grantId);
     return rows.map(r => ({ roleId: r.role_id, roleKind: r.role_kind }));
+}
+
+/**
+ * 列出某用户当前 active grants 管理的角色集合。
+ * excludeGrantId 用于结束某个 grant 前，保护同一用户其它 active grant 仍需要的重叠角色。
+ */
+async function listActiveSelfRoleGrantRolesForUser(guildId, userId, excludeGrantId = null) {
+    if (!guildId || !userId) return [];
+
+    const args = [guildId, userId];
+    let excludeSql = '';
+    if (excludeGrantId) {
+        excludeSql = 'AND g.grant_id <> ?';
+        args.push(excludeGrantId);
+    }
+
+    const stmt = selfRoleDb.prepare(`
+        SELECT DISTINCT
+            g.grant_id,
+            g.primary_role_id,
+            r.role_id,
+            r.role_kind
+        FROM sr_grants g
+        INNER JOIN sr_grant_roles r ON r.grant_id = g.grant_id
+        WHERE g.guild_id = ?
+          AND g.user_id = ?
+          AND g.status = 'active'
+          ${excludeSql}
+        ORDER BY r.role_kind ASC, r.role_id ASC
+    `);
+    const rows = stmt.all(...args);
+    return rows.map(r => ({
+        grantId: r.grant_id,
+        primaryRoleId: r.primary_role_id,
+        roleId: r.role_id,
+        roleKind: r.role_kind,
+    }));
 }
 
 /**
@@ -3755,6 +3828,7 @@ module.exports = {
     saveUserActivityAndDailyBatch,
     saveUserActivityAndDailyBatchByDate,
     getUserDailyActivity,
+    getUserDailyActivitySummary,
     getUserActiveDaysCount,
     getSelfRoleApplication,
     saveSelfRoleApplication,
@@ -3793,6 +3867,7 @@ module.exports = {
     endActiveSelfRoleGrantsForUserRole,
     createSelfRoleGrant,
     listSelfRoleGrantRoles,
+    listActiveSelfRoleGrantRolesForUser,
     countActiveSelfRoleGrantHoldersByRole,
     listActiveSelfRoleGrantsByPrimaryRole,
     listAllActiveSelfRoleGrants,

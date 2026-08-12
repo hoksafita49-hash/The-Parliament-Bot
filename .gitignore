@@ -20,3 +20,18 @@ rename_json_files.py
 backupdata/
 backupdata/
 .limcode/
+.claude/
+data/mystery/bombCooldowns.json
+data/mystery/bombCooldowns.corrupt-*.json
+data/mystery/bombCooldowns.*.tmp
+data/mystery/namePool.json
+data/mystery/namePool.json.tmp
+data/mystery/namePool.corrupt-*.json
+
+# 本地开发状态：测试 / 日志 / 代理启动器 / 规划文档（按需保留在本地）
+test/
+.local-bot.stdout.log
+.local-bot.stderr.log
+.local-discord-proxy-bootstrap.cjs
+.superpowers/
+.env.test
