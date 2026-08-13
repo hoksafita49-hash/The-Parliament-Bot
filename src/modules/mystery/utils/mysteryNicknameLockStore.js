@@ -210,13 +210,14 @@ function createMysteryNicknameLockStore({ filePath, fsImpl = fs, now = Date.now 
         return true;
     }
 
-    // 受限的 same-type replacement：当且仅当当前记录的 type 与 expectedType 一致时，
-    // 允许原子替换为新记录（preserving originalNickname）。用于 duel_rename 覆盖 duel_rename。
-    function replaceSameType(guildId, userId, record, expectedType) {
+    // 受限的 replacement：当前记录不存在时直接创建；
+    // 存在时仅当当前记录的 type ∈ expectedTypes 才允许原子替换为新记录。
+    // 用于普通锁互覆（duel_rename / devil_roulette_rename）与 coward 覆盖普通锁。
+    function replaceLock(guildId, userId, record, expectedTypes) {
         return queueMutation(async () => {
             const key = buildMysteryNicknameLockKey(guildId, userId);
             const current = locks[key];
-            if (current && current.type !== expectedType) return null;
+            if (current && !expectedTypes.includes(current.type)) return null;
 
             const normalized = normalizeRecord(record);
             if (!normalized) return null;
@@ -298,7 +299,7 @@ function createMysteryNicknameLockStore({ filePath, fsImpl = fs, now = Date.now 
         save,
         remove,
         removeLegacy,
-        replaceSameType,
+        replaceLock,
         update,
         listExpired,
         flush,

@@ -31,6 +31,8 @@ const DUPLICATE_MESSAGE = '👀 **你已经参加这场游戏了。**\n再点也
 const JOINED_MESSAGE = '✅ **你已加入运气轮盘**\n\n接下来就看命了。';
 const JOIN_FAILURE_MESSAGE = '❌ **参加运气轮盘失败了。**\n请稍后再试。';
 const NOT_YOUR_DECISION_MESSAGE = '🎰 **轮盘现在不听你的，等你中枪了再说。**';
+const STOP_ACK_MESSAGE = '🛑 **你选择了收手。**\n正在结算本局处罚……';
+const CONTINUE_ACK_MESSAGE = '🎰 **继续转！**\n下一轮马上开始。';
 
 function logDiscordFailure(game, action, error, userId = 'system') {
     console.error(
@@ -386,10 +388,20 @@ function clearDecisionTimer(game) {
 async function cleanupRouletteGame(game) {
     clearDecisionTimer(game);
     await waitForRecruitmentPanelQueue(game);
-    if (game.processMessage) {
-        invalidateProcessPanel(game, game.processMessage, 'game-cleanup', true);
+    // 过程面板（开局 + 每轮）：先禁用，释放游戏锁后按现有 5 秒延迟统一删除；
+    // 结算/全员中奖等最终结果面板不入此集合，永久保留。
+    const processMessages = [...(game.processMessages || [])];
+    for (const message of processMessages) {
+        invalidateProcessPanel(game, message, 'game-cleanup', true);
     }
     await gameManager.cleanupGame(game);
+    for (const message of processMessages) {
+        game.panelLifecycle.deleteMessageAfter(
+            message,
+            5_000,
+            { action: 'game-cleanup', guildId: game.guildId, gameId: game.id }
+        );
+    }
 }
 
 // ── Start ping helper ───────────────────────────────────────────────────────
@@ -491,10 +503,9 @@ function clearDecisionState(game) {
     game.currentWinnerId = null;
 }
 
-async function handleDecision(game, winnerId, choice) {
+// 同步认领本轮决定：成功才返回 action，随后先回复交互、再执行后续（结算/下一轮）。
+async function claimDecision(game, winnerId, choice) {
     let action = null;
-    let outcome = null;
-
     await gameManager.runExclusive(game, () => {
         if (game.ended || game.state !== 'playing') return;
         if (game.currentWinnerId !== winnerId) return;
@@ -505,27 +516,27 @@ async function handleDecision(game, winnerId, choice) {
         if (choice === 'stop') {
             game.endReason = 'stop';
             action = 'settle';
-        } else if (choice === 'continue') {
-            if (game.roundNumber >= MAX_ROUNDS) {
-                // Should not happen: round 6 has no continue button
-                game.endReason = 'round_limit';
-                action = 'settle';
-            } else {
-                outcome = 'continue';
-            }
+        } else if (game.roundNumber >= MAX_ROUNDS) {
+            // Should not happen: round 6 has no continue button
+            game.endReason = 'round_limit';
+            action = 'settle';
+        } else {
+            action = 'continue';
         }
     });
+    return action;
+}
 
+async function executeDecision(game, action) {
     if (action === 'settle') {
         await settleAndFinish(game);
-        return { settled: true };
+        return true;
     }
-
-    if (outcome === 'continue') {
+    if (action === 'continue') {
         await runNextRound(game);
+        return true;
     }
-
-    return { settled: false };
+    return false;
 }
 
 async function handleDecisionTimeout(game, expectedToken) {
@@ -657,11 +668,20 @@ async function runNextRound(game) {
         ? []
         : [decisionRow(game.id, roundData.decisionToken)];
 
-    // Edit the process message
-    await editMessage(game, game.processMessage, {
+    // 每轮新发一条消息，不覆盖旧面板：旧面板禁用按钮后保留可见，方便回看历史。
+    const previousMessages = [...(game.processMessages || [])];
+    game.processMessages = new Set();
+    for (const oldMessage of previousMessages) {
+        invalidateProcessPanel(game, oldMessage, 'round-superseded', true);
+    }
+
+    const roundMessage = await sendPublicPanel(game, {
         embeds: [makeEmbed(desc)],
         components,
-    }, 'round-update');
+    }, 'round-panel');
+    if (roundMessage) {
+        game.processMessages.add(roundMessage);
+    }
 
     if (roundData.forceEnd) {
         await settleAndFinish(game);
@@ -697,10 +717,9 @@ async function startGameplay(game, participantIds, members) {
             game.state = 'ended';
             game.settled = true;
 
-            // Send all-winners panel
-            const desc = allWinnersDescription();
-            await editMessage(game, game.processMessage, {
-                embeds: [makeEmbed(desc)],
+            // 全员中奖作为最终结果另发一条永久消息，开局面板保留不动。
+            const allWinnersMessage = await sendPublicPanel(game, {
+                embeds: [makeEmbed(allWinnersDescription())],
                 components: [],
             }, 'all-winners-result');
 
@@ -710,8 +729,8 @@ async function startGameplay(game, participantIds, members) {
                 participantIds.map(userId => ({ userId, minutes: ALL_WINNERS_TIMEOUT_MINUTES })),
                 members
             );
-            if (failedIds.length > 0) {
-                await editMessage(game, game.processMessage, {
+            if (failedIds.length > 0 && allWinnersMessage) {
+                await editMessage(game, allWinnersMessage, {
                     embeds: [makeEmbed(allWinnersFailedDescription(failedIds.length))],
                     components: [],
                 }, 'all-winners-failed');
@@ -825,7 +844,7 @@ async function settleClaimedGame(game) {
         return;
     }
 
-    game.processMessage = processMessage;
+    game.processMessages = new Set([processMessage]);
 
     // Transition to playing and start gameplay
     await gameManager.runExclusive(game, () => {
@@ -875,6 +894,7 @@ async function startRoulette(interaction, { panelLifecycle = defaultPanelLifecyc
         specialRollChecked: false,
         settled: false,
         endReason: null,
+        processMessages: new Set(),
         random: Math.random,
         timers: new Set(),
         panelLifecycle,
@@ -903,8 +923,10 @@ async function startRoulette(interaction, { panelLifecycle = defaultPanelLifecyc
     };
     provisionalGame.disableComponents = () => {
         clearDecisionTimer(game);
-        if (game?.processMessage) {
-            invalidateProcessPanel(game, game.processMessage, 'game-cleanup', true);
+        if (game?.processMessages?.size) {
+            for (const message of game.processMessages) {
+                invalidateProcessPanel(game, message, 'game-cleanup', true);
+            }
         } else {
             invalidateRecruitmentPanel(game, 'game-cleanup');
         }
@@ -1033,7 +1055,20 @@ async function handleDecisionInteraction(interaction, parts) {
         return false;
     }
 
-    await handleDecision(game, userId, choice);
+    // 先认领决定（防止 double click / timer race），再立即回复交互，最后执行。
+    const action = await claimDecision(game, userId, choice);
+    if (!action) {
+        await safePrivateResponse(interaction, EXPIRED_MESSAGE, game);
+        return false;
+    }
+
+    await safePrivateResponse(
+        interaction,
+        choice === 'stop' ? STOP_ACK_MESSAGE : CONTINUE_ACK_MESSAGE,
+        game
+    );
+
+    await executeDecision(game, action);
     return true;
 }
 

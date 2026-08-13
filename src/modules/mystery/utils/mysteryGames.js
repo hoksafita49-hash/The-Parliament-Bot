@@ -6,6 +6,7 @@ const MYSTERY_GAMES = Object.freeze({
     ROULETTE: '运气轮盘',
     BOMB: '传炸弹',
     DUEL: '死斗',
+    DEVIL_ROULETTE: '恶魔轮盘',
     PRESSURE: '加压轮盘',
 });
 
@@ -15,6 +16,7 @@ const MULTIPLAYER_GAME_NAMES = Object.freeze([
     MYSTERY_GAMES.ROULETTE,
     MYSTERY_GAMES.BOMB,
     MYSTERY_GAMES.DUEL,
+    MYSTERY_GAMES.DEVIL_ROULETTE,
     MYSTERY_GAMES.PRESSURE,
 ]);
 

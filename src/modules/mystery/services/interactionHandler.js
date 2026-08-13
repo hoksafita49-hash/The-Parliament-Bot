@@ -3,11 +3,17 @@ const gameManager = require('./mysteryGameManager');
 const { handleRouletteInteraction } = require('./rouletteGame');
 const { handleBombInteraction } = require('./bombGame');
 const { handleDuelInteraction } = require('./duelGame');
+const { handleDevilRouletteInteraction } = require('./devilRouletteGame');
 const {
     defaultService: duelPunishmentService,
     PUNISHMENT_CUSTOM_ID_PREFIX,
     RENAME_MODAL_CUSTOM_ID_PREFIX,
 } = require('./duelPunishment');
+const {
+    defaultService: devilPunishmentService,
+    PUNISHMENT_CUSTOM_ID_PREFIX: DEVIL_PUNISHMENT_CUSTOM_ID_PREFIX,
+    RENAME_MODAL_CUSTOM_ID_PREFIX: DEVIL_RENAME_MODAL_CUSTOM_ID_PREFIX,
+} = require('./devilRoulettePunishment');
 const {
     CUSTOM_ID_PREFIX: PRESSURE_CUSTOM_ID_PREFIX,
     handlePressureInteraction,
@@ -38,7 +44,20 @@ const ROUTES = Object.freeze({
     },
     duel: {
         accept: { component: 'button', partCount: 2 },
+        reject: { component: 'button', partCount: 2 },
+        cancel: { component: 'button', partCount: 2 },
         choice: { component: 'button', partCount: 4 },
+    },
+    devil_roulette: {
+        accept: { component: 'button', partCount: 2 },
+        reject: { component: 'button', partCount: 2 },
+        cancel: { component: 'button', partCount: 2 },
+        rules: { component: 'button', partCount: 2 },
+        shoot: { component: 'button', partCount: 4 },
+        items: { component: 'button', partCount: 3 },
+        item: { component: 'button', partCount: 4 },
+        surrender: { component: 'button', partCount: 3 },
+        surrender_confirm: { component: 'button', partCount: 4 },
     },
 });
 
@@ -46,6 +65,7 @@ const DOWNSTREAM_HANDLERS = Object.freeze({
     roulette: handleRouletteInteraction,
     bomb: handleBombInteraction,
     duel: handleDuelInteraction,
+    devil_roulette: handleDevilRouletteInteraction,
 });
 
 function componentKind(interaction) {
@@ -60,7 +80,7 @@ function parseMysteryCustomId(customId, kind) {
     }
 
     const parts = customId.split(':');
-    const routeMatch = /^mystery_(roulette|bomb|duel)_([a-z_]+)$/.exec(parts[0]);
+    const routeMatch = /^mystery_(roulette|bomb|duel|devil_roulette)_([a-z_]+)$/.exec(parts[0]);
     if (!routeMatch) return { valid: false, parts };
 
     const [, type, action] = routeMatch;
@@ -131,6 +151,14 @@ async function handleMysteryInteraction(interaction) {
     }
     if (interaction.isModalSubmit?.() && interaction.customId.startsWith(RENAME_MODAL_CUSTOM_ID_PREFIX)) {
         return duelPunishmentService.handleInteraction(interaction);
+    }
+
+    // 恶魔轮盘裁决会话（同样的独立路由模式）。
+    if (interaction.customId.startsWith(DEVIL_PUNISHMENT_CUSTOM_ID_PREFIX)) {
+        return devilPunishmentService.handleInteraction(interaction);
+    }
+    if (interaction.isModalSubmit?.() && interaction.customId.startsWith(DEVIL_RENAME_MODAL_CUSTOM_ID_PREFIX)) {
+        return devilPunishmentService.handleInteraction(interaction);
     }
 
     const kind = componentKind(interaction);
