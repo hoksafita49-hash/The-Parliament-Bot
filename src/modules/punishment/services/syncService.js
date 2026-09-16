@@ -1,14 +1,22 @@
+const { sendAnnouncement } = require('./punishmentAnnouncement');
 const {
+    findLatestActivePunishment,
     getSyncTargets,
     getWarnRoleForGuild,
     insertPunishmentRecord,
 } = require('./punishmentDatabase');
 
+function getExternalSyncTargets(sourceGuildId, capability) {
+    return getSyncTargets(sourceGuildId).filter(target =>
+        String(target.target_guild_id) !== String(sourceGuildId) && target[capability]
+    );
+}
+
 /**
  * 跨服务器同步封禁
  */
-async function syncBan(client, sourceGuildId, userId, reason) {
-    const targets = getSyncTargets(sourceGuildId).filter(t => t.sync_ban);
+async function syncBan(client, sourceGuildId, userId, reason, announcement = {}) {
+    const targets = getExternalSyncTargets(sourceGuildId, 'sync_ban');
     const results = [];
 
     for (const target of targets) {
@@ -19,12 +27,20 @@ async function syncBan(client, sourceGuildId, userId, reason) {
                 continue;
             }
             await guild.members.ban(userId, { reason: `[跨服同步] ${reason || ''}` });
-            insertPunishmentRecord({
+            const recordResult = insertPunishmentRecord({
                 guildId: target.target_guild_id,
                 targetUserId: userId,
                 executorId: 'SYNC',
                 type: 'ban',
                 reason: `[跨服同步] ${reason || ''}`,
+            });
+            await sendAnnouncement(client, guild.id, {
+                type: 'ban', targetUserId: userId,
+                executorId: announcement.executorId || client.user?.id,
+                reason: `[跨服同步] ${reason || ''}`,
+                punishmentId: String(recordResult.lastInsertRowid),
+                scopeGuildNames: guild.name,
+                fromSync: true,
             });
             results.push({ guildId: target.target_guild_id, guildName: guild.name, success: true });
         } catch (err) {
@@ -39,8 +55,8 @@ async function syncBan(client, sourceGuildId, userId, reason) {
 /**
  * 跨服务器同步解封
  */
-async function syncUnban(client, sourceGuildId, userId, reason) {
-    const targets = getSyncTargets(sourceGuildId).filter(t => t.sync_ban);
+async function syncUnban(client, sourceGuildId, userId, reason, announcement = {}) {
+    const targets = getExternalSyncTargets(sourceGuildId, 'sync_ban');
     const results = [];
 
     for (const target of targets) {
@@ -51,12 +67,23 @@ async function syncUnban(client, sourceGuildId, userId, reason) {
                 continue;
             }
             await guild.members.unban(userId, `[跨服同步] ${reason || ''}`);
-            insertPunishmentRecord({
+            let originalPunishment = null;
+            try { originalPunishment = findLatestActivePunishment(guild.id, userId, 'ban'); }
+            catch (err) { console.warn('[Punishment] 查询同步原处罚失败:', err.message); }
+            const recordResult = insertPunishmentRecord({
                 guildId: target.target_guild_id,
                 targetUserId: userId,
                 executorId: 'SYNC',
                 type: 'unban',
                 reason: `[跨服同步] ${reason || ''}`,
+            });
+            await sendAnnouncement(client, guild.id, {
+                type: 'unban', targetUserId: userId,
+                executorId: announcement.executorId || client.user?.id,
+                reason: `[跨服同步] ${reason || ''}`,
+                punishmentId: String(recordResult.lastInsertRowid),
+                scopeGuildNames: guild.name,  originalPunishment,
+                fromSync: true,
             });
             results.push({ guildId: target.target_guild_id, guildName: guild.name, success: true });
         } catch (err) {
@@ -71,8 +98,8 @@ async function syncUnban(client, sourceGuildId, userId, reason) {
 /**
  * 跨服务器同步禁言
  */
-async function syncMute(client, sourceGuildId, userId, durationMs, reason) {
-    const targets = getSyncTargets(sourceGuildId).filter(t => t.sync_mute);
+async function syncMute(client, sourceGuildId, userId, durationMs, reason, announcement = {}) {
+    const targets = getExternalSyncTargets(sourceGuildId, 'sync_mute');
     const results = [];
     const MAX_TIMEOUT_MS = 28 * 24 * 3600 * 1000;
 
@@ -91,7 +118,7 @@ async function syncMute(client, sourceGuildId, userId, durationMs, reason) {
             const cappedMs = Math.min(durationMs, MAX_TIMEOUT_MS);
             await member.timeout(cappedMs, `[跨服同步] ${reason || ''}`);
             const expiresAt = new Date(Date.now() + cappedMs).toISOString();
-            insertPunishmentRecord({
+            const recordResult = insertPunishmentRecord({
                 guildId: target.target_guild_id,
                 targetUserId: userId,
                 executorId: 'SYNC',
@@ -100,6 +127,16 @@ async function syncMute(client, sourceGuildId, userId, durationMs, reason) {
                 durationMs: cappedMs,
                 expiresAt,
             });
+            const payload = {
+                type: 'mute', targetUserId: userId,
+                executorId: announcement.executorId || client.user?.id,
+                reason: `[跨服同步] ${reason || ''}`,
+                punishmentId: String(recordResult.lastInsertRowid),
+                scopeGuildNames: guild.name, durationLabel: announcement.durationLabel || `${cappedMs / 1000}秒`,
+                fromSync: true,
+            };
+            if (announcement.pending) announcement.pending.push({ guildId: guild.id, payload });
+            else await sendAnnouncement(client, guild.id, payload);
             results.push({ guildId: target.target_guild_id, guildName: guild.name, success: true });
         } catch (err) {
             console.error(`[Punishment] 跨服禁言失败 target=${target.target_guild_id}:`, err.message);
@@ -113,8 +150,8 @@ async function syncMute(client, sourceGuildId, userId, durationMs, reason) {
 /**
  * 跨服务器同步警告身份组
  */
-async function syncWarnRole(client, sourceGuildId, userId, durationMs, reason) {
-    const targets = getSyncTargets(sourceGuildId).filter(t => t.sync_warn_role);
+async function syncWarnRole(client, sourceGuildId, userId, durationMs, reason, announcement = {}) {
+    const targets = getExternalSyncTargets(sourceGuildId, 'sync_warn_role');
     const results = [];
 
     for (const target of targets) {
@@ -136,7 +173,7 @@ async function syncWarnRole(client, sourceGuildId, userId, durationMs, reason) {
             }
             await member.roles.add(warnRoleId, `[跨服同步] ${reason || ''}`);
             const expiresAt = new Date(Date.now() + durationMs).toISOString();
-            insertPunishmentRecord({
+            const recordResult = insertPunishmentRecord({
                 guildId: target.target_guild_id,
                 targetUserId: userId,
                 executorId: 'SYNC',
@@ -144,6 +181,14 @@ async function syncWarnRole(client, sourceGuildId, userId, durationMs, reason) {
                 reason: `[跨服同步] ${reason || ''}`,
                 durationMs,
                 expiresAt,
+            });
+            if (!announcement.coveredGuildIds?.has(guild.id)) await sendAnnouncement(client, guild.id, {
+                type: 'warn_role', targetUserId: userId,
+                executorId: announcement.executorId || client.user?.id,
+                reason: `[跨服同步] ${reason || ''}`,
+                punishmentId: String(recordResult.lastInsertRowid),
+                scopeGuildNames: guild.name, durationLabel: announcement.durationLabel || `${durationMs / 1000}秒`,
+                fromSync: true,
             });
             results.push({ guildId: target.target_guild_id, guildName: guild.name, success: true });
         } catch (err) {
@@ -158,8 +203,8 @@ async function syncWarnRole(client, sourceGuildId, userId, durationMs, reason) {
 /**
  * 跨服务器同步解除禁言
  */
-async function syncUnmute(client, sourceGuildId, userId, reason) {
-    const targets = getSyncTargets(sourceGuildId).filter(t => t.sync_mute);
+async function syncUnmute(client, sourceGuildId, userId, reason, announcement = {}) {
+    const targets = getExternalSyncTargets(sourceGuildId, 'sync_mute');
     const results = [];
 
     for (const target of targets) {
@@ -185,12 +230,23 @@ async function syncUnmute(client, sourceGuildId, userId, reason) {
                 }
             }
 
-            insertPunishmentRecord({
+            let originalPunishment = null;
+            try { originalPunishment = findLatestActivePunishment(guild.id, userId, 'mute'); }
+            catch (err) { console.warn('[Punishment] 查询同步原处罚失败:', err.message); }
+            const recordResult = insertPunishmentRecord({
                 guildId: target.target_guild_id,
                 targetUserId: userId,
                 executorId: 'SYNC',
                 type: 'unmute',
                 reason: `[跨服同步] ${reason || ''}`,
+            });
+            await sendAnnouncement(client, guild.id, {
+                type: 'unmute', targetUserId: userId,
+                executorId: announcement.executorId || client.user?.id,
+                reason: `[跨服同步] ${reason || ''}`,
+                punishmentId: String(recordResult.lastInsertRowid),
+                scopeGuildNames: guild.name,  originalPunishment,
+                fromSync: true,
             });
             results.push({ guildId: target.target_guild_id, guildName: guild.name, success: true });
         } catch (err) {
