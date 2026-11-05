@@ -61,3 +61,10 @@
 检查与实际 API 无法原子化，外部管理员/其他 Bot 同时修改仍有极短竞态；已发出的请求无法撤销。只读查询沿用原 SDK 共享桶，可能延迟取消反馈，但下一次写操作仍重新鉴权。未知外部自动化无法从仓库识别。
 
 必须持久化本地数据目录，多实例需共享同一可靠 SQLite 文件；不同数据库副本不互斥。不自动删除任务/审计，需要运营备份、归档和磁盘监控。安全条件变化导致停止后，纠正配置并重新提交未执行名单，不降低安全约束。
+
+
+## 发布状态
+
+实现提交 `6e6809c`，已推送 `hoksafita49-hash/The-Parliament-Bot` 的 `feat/bulk-role-management` 分支，未修改任何 main 分支。目标仓库直接推送返回 403；通过已有 fork 推送成功。创建草稿 PR 的 GitHub 连接器和 CLI 均返回 `Resource not accessible by integration`，因此没有伪造 PR 编号或地址。
+
+[打开 PR 创建入口](https://github.com/ESSEX-CV9/The-Parliament-Bot/compare/main...hoksafita49-hash:feat/bulk-role-management?expand=1)。可直接使用同目录 `2026-11-05-bulk-role-management-pr.md` 的 PR 描述。当前工作区保留完整独立分支。
